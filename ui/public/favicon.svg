@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- ShiftGrid family: a tilted grid of gray squares, with one blue element breaking out.
+       For shiftWire the blue element is a lens: seeing the traffic. -->
+  <g transform="rotate(-15 30 36)" fill="#575756">
+    <rect x="8" y="22" width="15" height="15" rx="2.5"/>
+    <rect x="26" y="22" width="15" height="15" rx="2.5"/>
+    <rect x="8" y="40" width="15" height="15" rx="2.5"/>
+    <rect x="26" y="40" width="15" height="15" rx="2.5"/>
+  </g>
+  <circle cx="45" cy="19" r="11" fill="none" stroke="#3A97D3" stroke-width="5.5"/>
+  <circle cx="45" cy="19" r="3.5" fill="#3A97D3"/>
+</svg>

@@ -1,0 +1,205 @@
+/* Design tokens: calm neutrals, one accent, hairlines instead of boxes. */
+:root {
+  /* ShiftGrid family. One place for every color. */
+  --font: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+
+  --surface: #ffffff;
+  --sidebar: #f3f5fa;
+  --field: #eef1f7;
+  --hover: rgba(26, 31, 42, 0.05);
+  --selected: rgba(28, 156, 236, 0.13);
+  --hairline: #e2e6ef;
+  --text: #1a1f2a;
+  --text-2: #6b7388;
+  --text-3: #9aa1b2;
+  --accent: #1c9cec;
+  --green: #16a34a;
+  --red: #dc2626;
+  --orange: #ea580c;
+  --stripe: rgba(26, 31, 42, 0.022);
+
+  /* Row highlight palette (keys 1-7): ShiftGrid's --sp-* colors. */
+  --c-red: #dc2626;
+  --c-orange: #ea580c;
+  --c-yellow: #ca8a04;
+  --c-green: #16a34a;
+  --c-blue: #1c9cec;
+  --c-purple: #7c3aed;
+  --c-gray: #6b7388;
+
+  /* Mark severities */
+  --sev-info: #6b7388;
+  --sev-low: #16a34a;
+  --sev-medium: #ca8a04;
+  --sev-high: #dc2626;
+  --sev-critical: #c026d3;
+
+  /* One color per section, like ShiftGrid's --ic-*. */
+  --ic-history: #1c9cec;
+  --ic-repeater: #0d9488;
+  --ic-sitemap: #4f46e5;
+  --ic-timeline: #7c3aed;
+
+  --history-cols: 48px 64px 84px 60px minmax(110px, 1.2fr) minmax(140px, 2.4fr) 44px 64px 44px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #0f1115;
+    --sidebar: #161a22;
+    --field: #232a38;
+    --hover: rgba(255, 255, 255, 0.045);
+    --selected: rgba(28, 156, 236, 0.2);
+    --hairline: #262c38;
+    --text: #e6e8ee;
+    --text-2: #8b93a7;
+    --text-3: #5d6577;
+    --accent: #1c9cec;
+    --green: #4ade80;
+    --red: #f87171;
+    --orange: #fb923c;
+    --stripe: rgba(255, 255, 255, 0.018);
+
+    --c-red: #f87171;
+    --c-orange: #fb923c;
+    --c-yellow: #facc15;
+    --c-green: #4ade80;
+    --c-blue: #1c9cec;
+    --c-purple: #a78bfa;
+    --c-gray: #8b93a7;
+
+    --sev-info: #8b93a7;
+    --sev-low: #4ade80;
+    --sev-medium: #facc15;
+    --sev-high: #f87171;
+    --sev-critical: #d946ef;
+
+    --ic-history: #1c9cec;
+    --ic-repeater: #2dd4bf;
+    --ic-sitemap: #818cf8;
+    --ic-timeline: #a78bfa;
+  }
+}
+
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden; /* app-like: panes scroll, the page never does */
+  font: 13px/1.4 var(--font);
+  color: var(--text);
+  background: var(--surface);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  cursor: default;
+}
+
+button:disabled {
+  opacity: 0.5;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--field);
+}
+
+.sev-info { --sev: var(--sev-info); }
+.sev-low { --sev: var(--sev-low); }
+.sev-medium { --sev: var(--sev-medium); }
+.sev-high { --sev: var(--sev-high); }
+.sev-critical { --sev: var(--sev-critical); }
+
+::selection {
+  background: var(--selected);
+}
+
+/* Syntax colors for highlighted HTTP (spans from lib/highlight.ts), in History and the Repeater. */
+.syntax .method {
+  color: var(--accent);
+  font-weight: 600;
+}
+.syntax .target {
+  color: var(--text);
+}
+.syntax .mut {
+  color: var(--text-3);
+}
+.syntax .hk {
+  color: var(--c-purple);
+}
+.syntax .hv {
+  color: var(--text);
+}
+.syntax .code.ok {
+  color: var(--green);
+  font-weight: 600;
+}
+.syntax .code.redirect {
+  color: var(--accent);
+  font-weight: 600;
+}
+.syntax .code.client {
+  color: var(--orange);
+  font-weight: 600;
+}
+.syntax .code.server {
+  color: var(--red);
+  font-weight: 600;
+}
+.syntax .key {
+  color: var(--c-purple);
+}
+.syntax .str {
+  color: var(--green);
+}
+.syntax .num {
+  color: var(--orange);
+}
+.syntax .lit {
+  color: var(--accent);
+}
+.syntax .tag {
+  color: var(--accent);
+}
+.syntax .tagp {
+  color: var(--text-3);
+}
+.syntax .attr {
+  color: var(--c-purple);
+}
+.syntax .com {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+/* Status codes look the same in every view (classes from statusClass()). */
+.status.ok {
+  color: var(--green);
+}
+.status.redirect {
+  color: var(--accent);
+}
+.status.client {
+  color: var(--orange);
+}
+.status.server {
+  color: var(--red);
+}
+
+/* A request's color (History, Timeline, Site Map): a light tint and a bar on the left. */
+.colored {
+  background: color-mix(in srgb, var(--c) 14%, transparent);
+  box-shadow: inset 3px 0 var(--c);
+}

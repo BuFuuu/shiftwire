@@ -1,0 +1,27 @@
+# Rust
+/target
+
+# UI
+/ui/node_modules
+/ui/dist
+
+# Runtime data (projects, captures, CA keys)
+*.db
+*.db-wal
+*.db-shm
+*.key
+*.pem
+.shiftwire/
+shiftwire-projects/
+*.har
+
+# Local tool settings
+.claude/settings.local.json
+.mcp.json
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
