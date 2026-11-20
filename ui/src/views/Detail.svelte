@@ -5,13 +5,8 @@
   import { toCurl } from '../lib/curl';
   import SideSplit from '../components/SideSplit.svelte';
   import ContextMenu from '../components/ContextMenu.svelte';
-  import ViaBadge from '../components/ViaBadge.svelte';
-  import { describeVia } from '../lib/via';
-  import { jumpTo } from '../lib/live.svelte';
-  import { nav } from '../lib/nav.svelte';
   import { openTab } from '../lib/repeater.svelte';
   import { getDetail } from '../lib/detail';
-  import { bytes, statusClass } from '../lib/format';
   import type { FlowDetail } from '../lib/types';
 
   let { id, onclose }: { id: string; onclose: () => void } = $props();
@@ -64,23 +59,6 @@
 
 <div class="detail">
   {#if detail && detail.id === id}
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <header oncontextmenu={onContextMenu}>
-      <span class="seq">#{detail.seq}</span>
-      <span class="method">{detail.method}</span>
-      <span class="url" title={url}>{url}</span>
-      <span class="meta">
-        <span class="status {statusClass(detail.status)}">{detail.status ?? 'ERR'}</span>
-        · {bytes(detail.size)} · {detail.duration_ms} ms ·
-        <span class="actor" class:ai={detail.actor !== 'proxy'}>{detail.actor}</span>
-      </span>
-      <button class="act" onclick={() => openTab(detail!.id)} disabled={detail.method === 'CONNECT'} title="Open in a new Repeater tab">Repeater</button>
-      {#if nav.view !== 'history'}
-        <button class="act" onclick={() => jumpTo(`id:${detail!.seq}`, `#${detail!.seq}`)} title="Show this request in History">History</button>
-      {/if}
-      <button class="close" onclick={onclose} title="Close (Esc)">✕</button>
-    </header>
-    <p class="meta-line"><ViaBadge flow={detail} /> {describeVia(detail)}</p>
     {#if detail.error}<p class="error">{detail.error}</p>{/if}
     {#if detail.mark}
       <p class="meta-line"><span class="mark sev-{detail.mark}">★ {detail.mark}</span> {detail.mark_reason}</p>
@@ -95,7 +73,7 @@
     <div class="panes" oncontextmenu={onContextMenu}>
       <SideSplit name="detail">
         {#snippet left()}<HttpMessage title="Request" pane="request" message={detail!.request} extra={extras('request')} />{/snippet}
-        {#snippet right()}<HttpMessage title="Response" pane="response" message={detail!.response} extra={extras('response')} />{/snippet}
+        {#snippet right()}<HttpMessage title="Response" pane="response" message={detail!.response} extra={extras('response')} {onclose} />{/snippet}
       </SideSplit>
     </div>
     {#if menu}
@@ -115,63 +93,6 @@
     display: flex;
     flex-direction: column;
     background: var(--surface);
-  }
-  header {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    height: 38px;
-    padding: 0 12px 0 16px;
-    border-bottom: 1px solid var(--hairline);
-  }
-  .seq {
-    color: var(--text-3);
-    font-variant-numeric: tabular-nums;
-  }
-  .method {
-    font-weight: 600;
-  }
-  .act {
-    flex: none;
-    padding: 2px 10px;
-    border: 1px solid var(--hairline);
-    border-radius: 7px;
-    background: none;
-    color: var(--text-2);
-    font-size: 12px;
-  }
-  .act:hover:not(:disabled) {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 50%, transparent);
-  }
-  .url {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font: 12.5px var(--mono);
-  }
-  .meta {
-    color: var(--text-2);
-    font-size: 12px;
-    white-space: nowrap;
-  }
-  .actor.ai {
-    color: var(--accent);
-  }
-  .close {
-    border: 0;
-    background: none;
-    color: var(--text-3);
-    font-size: 13px;
-    width: 24px;
-    height: 24px;
-    border-radius: 6px;
-  }
-  .close:hover {
-    background: var(--hover);
-    color: var(--text);
   }
   .error {
     margin: 0;

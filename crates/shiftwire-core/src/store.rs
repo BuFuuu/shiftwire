@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::events::{Bus, Event};
 use crate::filter::Filter;
-use crate::model::{Flow, FlowSummary, McpCall, RepeaterTab, TimelineEntry};
+use crate::model::{Burst, Flow, FlowSummary, HistoryWindow, McpCall, RepeaterTab, TimelineEntry};
 use crate::sender::Target;
 
 const QUEUE_LEN: usize = 10_000;
@@ -222,6 +222,145 @@ impl Store {
             .collect::<Result<_, _>>()?;
         rows.reverse();
         Ok(rows)
+    }
+
+    /// One window of History: up to `limit` matches from position `offset` (0 = first
+    /// in this order; past the end, or none: the last page), or centered on the flow
+    /// `around` if it matches (a selected row stays in view when the filter changes).
+    /// Sorted by `sort` (a History column, ties in time order).
+    pub fn query_window(
+        &self,
+        filter: &Filter,
+        sort: &str,
+        desc: bool,
+        offset: Option<usize>,
+        around: Option<&str>,
+        limit: usize,
+    ) -> rusqlite::Result<HistoryWindow> {
+        let total = self.count_matching(filter)?;
+        let column = match sort {
+            "actor" => "actor",
+            "via" => crate::filter::VIA_SQL,
+            "method" => "method",
+            "host" => "host",
+            "path" => "path",
+            "status" => "COALESCE(status, -1)",
+            "size" => "resp_size",
+            "duration_ms" => "ts_end - ts_start",
+            _ => "id", // "n": the # and Time columns
+        };
+        let dir = if desc { "DESC" } else { "ASC" };
+        let order = if column == "id" {
+            format!("id {dir}")
+        } else {
+            format!("{column} {dir}, id ASC")
+        };
+        let (where_sql, filter_params) = filter.to_sql();
+        let mut params: Vec<Value> = filter_params.into_iter().map(Value::Text).collect();
+        let conn = self.conn.lock().expect("store lock");
+        let position = match around {
+            Some(id) => position_of(&conn, &where_sql, &params, column, desc, id)?,
+            None => None,
+        };
+        let start = match (position, offset) {
+            (Some(p), _) => p.saturating_sub(limit / 2),
+            (None, Some(o)) if o < total as usize => o,
+            _ => (total as usize).saturating_sub(limit),
+        };
+        params.push(Value::Integer(limit as i64));
+        params.push(Value::Integer(start as i64));
+        let n = params.len();
+        // Pick the ids first, so the per-row subqueries run for this page only.
+        let sql = format!(
+            "SELECT {SUMMARY_COLS} FROM flows WHERE id IN
+               (SELECT id FROM flows WHERE {where_sql} ORDER BY {order} LIMIT ?{} OFFSET ?{n})
+             ORDER BY {order}",
+            n - 1
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(params), |r| {
+                summary_row(r).map(|f| f.summary())
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(HistoryWindow {
+            rows,
+            offset: start,
+            total,
+            position,
+        })
+    }
+
+    /// The burst flow `id` belongs to: walk its actor's requests (same way in) forward
+    /// and back, one by one, until a quiet gap longer than `gap_ms`. No time limit,
+    /// so a long scan is one burst.
+    pub fn burst(&self, id: &str, gap_ms: u64) -> rusqlite::Result<Option<Burst>> {
+        let conn = self.conn.lock().expect("store lock");
+        let row = |r: &Row| -> rusqlite::Result<(u64, u64, u64)> {
+            Ok((int(r, "seq")?, int(r, "ts_start")?, int(r, "ts_end")?))
+        };
+        let Some((actor, source, (seq, ts, end))) = conn
+            .query_row(
+                "SELECT actor, source, COALESCE(seq, 0) AS seq, ts_start, ts_end FROM flows WHERE id = ?1",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, row(r)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let via = crate::model::via(&source).to_string();
+        let mut b = Burst {
+            actor,
+            via,
+            count: 1,
+            first_seq: seq,
+            first_ts: ts,
+            last_seq: seq,
+            last_ts: ts,
+            gap_ms,
+            largest_gap_ms: 0,
+            gap_before_ms: None,
+            gap_after_ms: None,
+        };
+        let others = |newer: bool| {
+            format!(
+                "SELECT COALESCE(seq, 0) AS seq, ts_start, ts_end FROM flows
+                 WHERE id {} ?1 AND actor = ?2 AND ({}) = ?3 ORDER BY id {}",
+                if newer { ">" } else { "<" },
+                crate::filter::VIA_SQL,
+                if newer { "ASC" } else { "DESC" },
+            )
+        };
+        // Forward: the next one belongs if it starts soon after everything so far ended.
+        let mut stmt = conn.prepare(&others(true))?;
+        let mut rows = stmt.query(params![id, b.actor, b.via])?;
+        let mut ended = end;
+        while let Some(r) = rows.next()? {
+            let (s, t, e) = row(r)?;
+            let gap = t.saturating_sub(ended);
+            if gap > gap_ms {
+                b.gap_after_ms = Some(gap);
+                break;
+            }
+            (b.largest_gap_ms, ended) = (b.largest_gap_ms.max(gap), ended.max(e));
+            (b.count, b.last_seq, b.last_ts) = (b.count + 1, s, t);
+        }
+        drop(rows);
+        // Back: the previous one belongs if it ended soon before the burst started.
+        let mut stmt = conn.prepare(&others(false))?;
+        let mut rows = stmt.query(params![id, b.actor, b.via])?;
+        while let Some(r) = rows.next()? {
+            let (s, t, e) = row(r)?;
+            let gap = b.first_ts.saturating_sub(e);
+            if gap > gap_ms {
+                b.gap_before_ms = Some(gap);
+                break;
+            }
+            b.largest_gap_ms = b.largest_gap_ms.max(gap);
+            (b.count, b.first_seq, b.first_ts) = (b.count + 1, s, t);
+        }
+        Ok(Some(b))
     }
 
     /// How many flows match `filter` (for "2,000 of 41,230" in the UI).
@@ -695,6 +834,42 @@ fn insert(conn: &mut Connection, batch: &[Flow]) -> rusqlite::Result<()> {
 }
 
 /// SQLite integers are i64; sizes and timestamps are never negative.
+/// Where flow `id` is among the flows matching `where_sql`, ordered by `column`
+/// (ties by id); `None` if it does not match.
+fn position_of(
+    conn: &Connection,
+    where_sql: &str,
+    params: &[Value],
+    column: &str,
+    desc: bool,
+    id: &str,
+) -> rusqlite::Result<Option<usize>> {
+    let mut params = params.to_vec();
+    params.push(Value::Text(id.to_string()));
+    let x = params.len();
+    let matches: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM flows WHERE id = ?{x} AND {where_sql})"),
+        params_from_iter(&params),
+        |r| r.get(0),
+    )?;
+    if !matches {
+        return Ok(None);
+    }
+    let lt = if desc { ">" } else { "<" };
+    let before = if column == "id" {
+        format!("id {lt} ?{x}")
+    } else {
+        let mine = format!("(SELECT {column} FROM flows WHERE id = ?{x})");
+        format!("({column} {lt} {mine} OR ({column} = {mine} AND id < ?{x}))")
+    };
+    let n: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM flows WHERE ({where_sql}) AND {before}"),
+        params_from_iter(&params),
+        |r| r.get(0),
+    )?;
+    Ok(Some(n as usize))
+}
+
 fn int(r: &Row, column: &str) -> rusqlite::Result<u64> {
     Ok(r.get::<_, i64>(column)? as u64)
 }
@@ -1041,6 +1216,7 @@ mod tests {
             "status:>=400 status:<500",
             "size:>1k",
             "size:<=1k",
+            "ts:>=3 ts:<=5",
             "ms:>=100",
             "tag:idor",
             "tag:auth*",
@@ -1128,6 +1304,63 @@ mod tests {
             older.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
             ["/1", "/2"]
         );
+        let paths = |rows: &[FlowSummary]| rows.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        let w = |sort, desc, offset, around| {
+            store
+                .query_window(&all, sort, desc, offset, around, 2)
+                .unwrap()
+        };
+        let last = w("n", false, None, None);
+        assert_eq!(
+            (paths(&last.rows), last.offset, last.total),
+            (vec!["/3".into(), "/4".into()], 3, 5)
+        );
+        let first = w("n", false, Some(0), None);
+        assert_eq!(
+            (paths(&first.rows), first.offset),
+            (vec!["/0".into(), "/1".into()], 0)
+        );
+        let past = w("n", false, Some(99), None);
+        assert_eq!(
+            (paths(&past.rows), past.offset),
+            (vec!["/3".into(), "/4".into()], 3),
+            "past the end: last page"
+        );
+        let by_status = store
+            .query_window(&all, "status", true, Some(0), None, 5)
+            .unwrap();
+        assert_eq!(
+            paths(&by_status.rows),
+            ["/1", "/3", "/0", "/2", "/4"],
+            "404s first, ties in time order"
+        );
+        let id = |p: &str| {
+            let f = by_status.rows.iter().find(|f| f.path == p).unwrap();
+            f.id.clone()
+        };
+        let (id2, id0) = (id("/2"), id("/0"));
+        assert_eq!(w("n", false, Some(0), Some(&id2)).position, Some(2));
+        let sorted = w("status", true, None, Some(&id0));
+        assert_eq!(sorted.position, Some(2), "in the sorted order");
+        let only_404 = Filter::parse("status:404").unwrap();
+        let gone = store
+            .query_window(&only_404, "n", false, Some(0), Some(&id("/0")), 2)
+            .unwrap();
+        assert_eq!(
+            (gone.position, gone.offset),
+            (None, 0),
+            "not matching: the offset as asked"
+        );
+        let mid = &store.query(&all, 5).unwrap()[2];
+        let burst = store.burst(&mid.id, 1000).unwrap().unwrap();
+        assert_eq!((burst.count, burst.first_seq, burst.last_seq), (5, 1, 5));
+        assert_eq!((burst.gap_before_ms, burst.gap_after_ms), (None, None));
+        let overlapping = store.burst(&mid.id, 0).unwrap().unwrap();
+        assert_eq!(
+            overlapping.count, 5,
+            "each overlaps the next: no gap at all"
+        );
+        assert!(store.burst("nope", 1000).unwrap().is_none());
         let not_found = Filter::parse("status:404").unwrap();
         assert_eq!(store.count_matching(&not_found).unwrap(), 2);
         assert_eq!(store.count_matching(&all).unwrap(), 5);

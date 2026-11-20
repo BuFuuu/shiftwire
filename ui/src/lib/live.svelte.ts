@@ -9,9 +9,8 @@ import { loadTabs, repeater } from './repeater.svelte';
 import { nav } from './nav.svelte';
 import type { AgentMode, FlowSummary, WireEvent, Status, TimelineEntry, RuleAlert, McpCall } from './types';
 
-const MAX_FLOWS = 100_000;
-/** Rows per request: small pages keep every filter change instant. */
-const PAGE = 2000;
+/** Rows per request: small pages keep every filter change and jump instant. */
+const PAGE = 500;
 const FILTER_KEY = 'shiftwire.filter';
 const PINS_KEY = 'shiftwire.pins';
 
@@ -72,14 +71,35 @@ function scopeFilter(): string {
   return [include, ...exclude].join(' ');
 }
 
+export type SortKey = 'n' | 'actor' | 'via' | 'method' | 'host' | 'path' | 'status' | 'size' | 'duration_ms';
+
+/** History holds a slot for every match, so the scrollbar is the whole list; the
+ *  rows in view are loaded by position (`ensureRows`). The server sorts. */
 class History {
-  /** The newest matching flows, in time order. `raw`: rows are replaced, never mutated. */
-  flows = $state.raw<FlowSummary[]>([]);
-  /** How many flows match the filter in total (older ones load on scroll). */
-  total = $state(0);
-  loadingOlder = $state(false);
+  /** Every match in the order shown; `undefined`: not loaded yet. `raw`: replaced, never mutated. */
+  rows = $state.raw<(FlowSummary | undefined)[]>([]);
+  /** How many flows match the filter. */
+  total = $derived(this.rows.length);
+  /** `n` ascending is time order: the only order live rows are inserted into directly. */
+  sort = $state<{ key: SortKey; desc: boolean }>({ key: 'n', desc: false });
+  /** Kept current by the view, so a reload shows the same place: the first row in view,
+   *  and whether it sticks to the bottom (the newest rows). */
+  viewStart = 0;
+  follow = true;
+  /** The selected row (kept by the view): a reload for a new filter or sort centers on it. */
+  selected: string | null = null;
+  /** Set by such a reload: the row the view should scroll to. */
+  reveal = $state<{ index: number } | null>(null);
+  /** The burst gap for the line next to the numbers (the last one picked in the menu). */
+  burstGap = $state(2000);
 }
 export const history = new History();
+const timeOrder = () => history.sort.key === 'n' && !history.sort.desc;
+
+export function setSort(key: SortKey): void {
+  history.sort = history.sort.key === key ? { key, desc: !history.sort.desc } : { key, desc: false };
+  void loadHistory();
+}
 
 const AGENT_FLOWS = 2000;
 
@@ -192,7 +212,7 @@ export function idRange(text: string): [number, number] | null {
 
 export function effectiveFilter(): string {
   // A chip is row text (`*mozilla*`), or one field term as in the filter (`status:3*`).
-  const field = /^(host|path|url|method|actor|via|color|mime|type|note|tag|status|size|ms|time|id|#|is|has):\S+$/i;
+  const field = /^(host|path|url|method|actor|via|color|mime|type|note|tag|status|size|ms|time|id|ts|#|is|has):\S+$/i;
   const terms = (t: string) => t.trim().split(/\s+/);
   const quote = (t: string) =>
     terms(t).every((w) => w === 'OR' || field.test(w.replace(/^\(+|\)+$/g, ''))) ? `(${t})` : `"${t.replaceAll('"', '')}"`;
@@ -304,33 +324,107 @@ function handle(event: WireEvent): void {
       live.filterError = null;
       break;
     case 'resync':
-      void loadHistory();
+      void loadHistory(false);
       break;
   }
 }
 
-async function fetchPage(before: string | null, signal?: AbortSignal) {
-  const query = new URLSearchParams({ limit: String(PAGE), filter: effectiveFilter() });
-  if (before) query.set('before', before);
+/** Up to `limit` matches from position `offset` (none: the last page). */
+function fetchWindow(offset: number | null, limit: number, signal?: AbortSignal, around?: string | null) {
+  const query = new URLSearchParams({
+    limit: String(limit),
+    filter: effectiveFilter(),
+    sort: history.sort.key,
+    desc: String(history.sort.desc),
+  });
+  if (offset !== null) query.set('offset', String(offset));
+  if (around) query.set('around', around);
   return fetch(`/api/flows?${query}`, { signal });
 }
 
-/** (Re)load the newest page; live events that arrive meanwhile are merged after.
- *  A newer call cancels an older one still in flight (fast typing in the filter). */
-async function loadHistory(): Promise<void> {
+/** Bumped by every reload: pages still in flight from before are dropped. */
+let generation = 0;
+let pages = new Map<number, Promise<void>>();
+
+/** Puts fetched rows at their positions (rows the client does not know of yet arrive as live events). */
+function place(flows: FlowSummary[], offset: number) {
+  const out = history.rows.slice();
+  flows.forEach((f, j) => {
+    const i = offset + j;
+    if (i >= out.length) return;
+    const old = out[i];
+    if (old && old.id !== f.id) seen.delete(old.id);
+    out[i] = f;
+    seen.add(f.id);
+  });
+  history.rows = out;
+}
+
+/** Load the pages that have unloaded rows in `start..end`. */
+export function ensureRows(start: number, end: number): Promise<void> {
+  if (loading) return Promise.resolve(); // positions are about to change; the new rows trigger this again
+  const rows = history.rows;
+  const waits: Promise<void>[] = [];
+  for (let i = Math.max(0, start); i < Math.min(end, rows.length); i++) {
+    if (rows[i]) continue;
+    const page = Math.floor(i / PAGE);
+    waits.push(pages.get(page) ?? loadPage(page));
+    i = (page + 1) * PAGE - 1; // on to the next page
+  }
+  return Promise.all(waits).then(() => {});
+}
+
+function loadPage(page: number): Promise<void> {
+  const g = generation;
+  const done = (async () => {
+    try {
+      const res = await fetchWindow(page * PAGE, PAGE);
+      if (!res.ok || g !== generation) return;
+      const flows = (await res.json()) as FlowSummary[];
+      if (g === generation) place(flows, Number(res.headers.get('x-offset')));
+    } finally {
+      if (g === generation) pages.delete(page);
+    }
+  })();
+  pages.set(page, done);
+  return done;
+}
+
+/** The loaded rows in `start..end`, after loading what is missing. */
+export async function rowsIn(start: number, end: number): Promise<FlowSummary[]> {
+  await ensureRows(start, end);
+  return history.rows.slice(start, end).filter((f) => f !== undefined);
+}
+
+/** The newest matching flow (History's Clear button). */
+export async function newestMatch(): Promise<FlowSummary | undefined> {
+  const res = await fetch(`/api/flows?${new URLSearchParams({ limit: '1', filter: effectiveFilter() })}`);
+  return res.ok ? ((await res.json()) as FlowSummary[])[0] : undefined;
+}
+
+/** (Re)load after the filter or sort changed: around the selected row if it still
+ *  matches (`keepSelected`), else at the place in view (the bottom when following).
+ *  Live events that arrive meanwhile are merged after. A newer call cancels an older
+ *  one still in flight (fast typing in the filter). */
+async function loadHistory(keepSelected = true): Promise<void> {
   inflight?.abort();
   const controller = new AbortController();
   inflight = controller;
+  const g = ++generation;
+  pages = new Map();
   loading = true;
   pending = [];
   try {
-    const res = await fetchPage(null, controller.signal);
+    const offset = history.follow ? null : Math.max(0, history.viewStart - 50);
+    const res = await fetchWindow(offset, PAGE, controller.signal, keepSelected ? history.selected : null);
     if (res.ok) {
       const flows = (await res.json()) as FlowSummary[];
-      if (controller.signal.aborted) return;
-      history.flows = flows;
-      history.total = Number(res.headers.get('x-total-count') ?? flows.length);
-      seen = new Set(flows.map((f) => f.id));
+      if (controller.signal.aborted || g !== generation) return;
+      seen = new Set();
+      history.rows = new Array(Number(res.headers.get('x-total-count') ?? flows.length));
+      place(flows, Number(res.headers.get('x-offset') ?? 0));
+      const position = res.headers.get('x-position');
+      if (position) history.reveal = { index: Number(position) };
       live.filterError = null;
     } else if (res.status === 400) {
       live.filterError = await res.text();
@@ -346,35 +440,34 @@ async function loadHistory(): Promise<void> {
   }
 }
 
-/** Load the page before the oldest loaded row. Returns how many rows were added. */
-export async function loadOlder(): Promise<number> {
-  const oldest = history.flows[0];
-  if (!oldest || loading || history.loadingOlder || history.flows.length >= history.total) return 0;
-  history.loadingOlder = true;
-  try {
-    const res = await fetchPage(oldest.id);
-    if (!res.ok || history.flows[0] !== oldest) return 0; // the filter changed meanwhile
-    const older = ((await res.json()) as FlowSummary[]).filter((f) => !seen.has(f.id));
-    older.forEach((f) => seen.add(f.id));
-    history.flows = older.concat(history.flows).slice(-MAX_FLOWS);
-    return older.length;
-  } finally {
-    history.loadingOlder = false;
-  }
+/** In other orders a new or changed row can land anywhere: reload the place in view, at most a few times a second. */
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+function refreshSoon(): void {
+  refreshTimer ??= setTimeout(() => {
+    refreshTimer = undefined;
+    void loadHistory(false); // a background refresh: do not pull the view back
+  }, 300);
 }
 
 /** Swap in newer versions of rows already in the list (tags, color, note). */
 export function replaceFlows(updated: FlowSummary[]): void {
   const byId = new Map(updated.map((f) => [f.id, f]));
-  if (!history.flows.some((f) => byId.has(f.id))) return;
-  history.flows = history.flows.map((f) => byId.get(f.id) ?? f);
+  if (!updated.some((f) => seen.has(f.id))) return;
+  history.rows = history.rows.map((f) => (f && byId.get(f.id)) || f); // map keeps unloaded slots
 }
 
 function removeFlows(ids: string[]): void {
   const gone = new Set(ids);
-  const before = history.flows.length;
-  history.flows = history.flows.filter((f) => !gone.has(f.id));
-  history.total = Math.max(0, history.total - (before - history.flows.length));
+  if (!ids.some((id) => seen.has(id))) {
+    if (!timeOrder()) refreshSoon(); // maybe one not loaded: the count changed
+    return;
+  }
+  const out = history.rows.slice();
+  for (let i = out.length - 1; i >= 0; i--) {
+    const f = out[i];
+    if (f && gone.has(f.id)) out.splice(i, 1);
+  }
+  history.rows = out;
   gone.forEach((id) => seen.delete(id));
 }
 
@@ -389,10 +482,11 @@ function scheduleFlush(): void {
     flushScheduled = false;
     // Requests overlap and finish in any order, so dedupe by id, not by position.
     const fresh = pending.filter((f) => !seen.has(f.id));
-    fresh.forEach((f) => seen.add(f.id));
-    history.total += fresh.length;
     pending = [];
-    if (fresh.length) history.flows = insertByTime(history.flows, fresh).slice(-MAX_FLOWS);
+    if (!fresh.length) return;
+    if (!timeOrder()) return refreshSoon();
+    fresh.forEach((f) => seen.add(f.id));
+    history.rows = insertByTime(history.rows, fresh);
   };
   requestAnimationFrame(flush);
   setTimeout(flush, 100);
@@ -403,25 +497,14 @@ export function before(a: FlowSummary, b: FlowSummary): boolean {
   return a.ts < b.ts || (a.ts === b.ts && a.id < b.id);
 }
 
-/** Position of `f` in a time-ordered list (binary search). */
-export function timeIndex(list: FlowSummary[], f: FlowSummary): number {
-  let lo = 0;
-  let hi = list.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (before(list[mid], f)) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-/** Requests finish out of order; keep the list in start order. Appends stay O(1). */
-function insertByTime(list: FlowSummary[], fresh: FlowSummary[]): FlowSummary[] {
+/** Requests finish out of order; keep the list in start order. New rows belong at
+ *  or near the end, so walk back from there (an unloaded slot ends the walk). */
+function insertByTime(list: (FlowSummary | undefined)[], fresh: FlowSummary[]): (FlowSummary | undefined)[] {
   const out = list.slice();
   for (const f of fresh.sort((a, b) => (before(a, b) ? -1 : 1))) {
-    const last = out.at(-1);
-    if (!last || before(last, f)) out.push(f);
-    else out.splice(timeIndex(out, f), 0, f);
+    let i = out.length;
+    while (i > 0 && out[i - 1] && before(f, out[i - 1]!)) i--;
+    out.splice(i, 0, f);
   }
   return out;
 }

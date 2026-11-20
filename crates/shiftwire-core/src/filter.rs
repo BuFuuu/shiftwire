@@ -11,6 +11,8 @@
 //!   and wildcards on the digits: `status:2*`, `id:12*`.
 //! * `is:error`, `is:noted`, `is:tagged`, `is:ai`, `is:tunnel`, `is:marked`.
 //! * `id:` is the `#` in History: `id:>120` hides #1-#120 (History's Clear button).
+//! * `ts:` is when the request started, in unix milliseconds: `ts:>=1700000000000`
+//!   (History's "around this request" and "burst" views).
 //! * Bare words search everything a History row shows: actor, method,
 //!   host:port, path and query, status, and the tags.
 //!
@@ -75,6 +77,8 @@ enum NumField {
     Ms,
     /// The `#` in History.
     Id,
+    /// Start time, unix milliseconds.
+    Ts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,7 +111,7 @@ fn row_text(f: &FlowSummary) -> String {
 }
 
 /// [`crate::model::via`] in SQL.
-const VIA_SQL: &str =
+pub(crate) const VIA_SQL: &str =
     "CASE WHEN source LIKE 'invisible:%' OR source = 'redirect' THEN 'invisible' ELSE source END";
 
 const ROW_TEXT_SQL: &str = "actor || ' ' || method || ' ' || host || ':' || port || ' ' || path     || COALESCE('?' || query, '') || ' ' || COALESCE(status, '')";
@@ -458,6 +462,7 @@ fn term(word: &str) -> Result<Node, FilterError> {
         "size" => number(NumField::Size, value),
         "ms" | "time" => number(NumField::Ms, value),
         "id" | "#" => number(NumField::Id, value),
+        "ts" => number(NumField::Ts, value),
         "is" | "has" => match value.to_ascii_lowercase().as_str() {
             "error" | "failed" => Ok(Node::Is(Flag::Error)),
             "noted" | "note" => Ok(Node::Is(Flag::Noted)),
@@ -486,6 +491,7 @@ impl NumField {
             NumField::Size => f.size,
             NumField::Ms => f.duration_ms,
             NumField::Id => f.seq,
+            NumField::Ts => f.ts,
         }
     }
 
@@ -495,6 +501,7 @@ impl NumField {
             NumField::Size => "resp_size",
             NumField::Ms => "(ts_end - ts_start)",
             NumField::Id => "seq",
+            NumField::Ts => "ts_start",
         }
     }
 }
@@ -588,6 +595,7 @@ mod tests {
         assert!(m("status:>=400 status:4xx", &f));
         assert!(!m("status:5xx", &f));
         assert!(m("size:>1k size:<=2k ms:>100", &f));
+        assert!(m("ts:>=0 ts:<=0", &f) && !m("ts:>0", &f));
         assert!(m("admin", &f), "bare words search the whole row");
         let mut tagged = f.clone();
         tagged.tags = vec!["recon".into()];

@@ -41,7 +41,7 @@
   --ic-sitemap: #4f46e5;
   --ic-timeline: #7c3aed;
 
-  --history-cols: 48px 64px 80px 72px 56px minmax(90px, 1.2fr) minmax(92px, 2.4fr) 44px 60px 44px;
+  --history-cols: 48px 74px 64px 80px 72px 56px minmax(90px, 1.2fr) minmax(92px, 2.4fr) 44px 60px 44px;
 }
 
 @media (prefers-color-scheme: dark) {

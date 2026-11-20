@@ -17,12 +17,15 @@
     pane,
     message,
     extra,
+    onclose,
   }: {
     title: string;
     pane: 'request' | 'response';
     message: Message | null;
     /** More menu items from the view (e.g. Copy URL, Send to Repeater), at the click position. */
     extra?: (x: number, y: number) => MenuItem[];
+    /** Shows a close button (the details pane: Esc does the same). */
+    onclose?: () => void;
   } = $props();
 
   const NL = String.fromCharCode(10);
@@ -89,6 +92,7 @@
         </button>
       {/each}
     </div>
+    {#if onclose}<button class="close" onclick={onclose} title="Close (Esc)" aria-label="Close">✕</button>{/if}
   </header>
 
   <div class="content">
@@ -151,6 +155,19 @@
     color: var(--text-2);
     text-transform: uppercase;
     letter-spacing: 0.04em;
+  }
+  .close {
+    border: 0;
+    background: none;
+    color: var(--text-3);
+    font-size: 13px;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+  }
+  .close:hover {
+    background: var(--hover);
+    color: var(--text);
   }
   .tabs {
     margin-left: auto;

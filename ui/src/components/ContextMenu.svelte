@@ -6,6 +6,7 @@
   import { toCurl, flowUrl } from '../lib/curl';
   import { getDetail } from '../lib/detail';
   import { addPin, jumpTo } from '../lib/live.svelte';
+  import { BURST_GAPS, DEFAULT_GAP, showBurst } from '../lib/around';
   import { nav } from '../lib/nav.svelte';
   import { openTab } from '../lib/repeater.svelte';
   import { COLORS, SEVERITIES, type FlowSummary } from '../lib/types';
@@ -149,6 +150,14 @@
   <div class="sep"></div>
   <button class="item" onclick={() => pin('show', `host:=${first.host}`)}>Only {first.host}</button>
   <button class="item" onclick={() => pin('hide', `host:=${first.host}`)}>Hide {first.host}</button>
+  <div class="burst" title="The run of requests by {first.actor} this one belongs to: no pause between two of them longer than the gap. Roughly what one click or page load sent.">
+    <button class="item" onclick={() => (void showBurst(first, DEFAULT_GAP), onclose())}>Show burst</button>
+    <div class="gaps" role="group" aria-label="Longest pause inside the burst">
+      {#each BURST_GAPS as s (s)}
+        <button class:default={s === DEFAULT_GAP} title="Pauses up to {s} s" onclick={() => (void showBurst(first, s), onclose())}>{s}s</button>
+      {/each}
+    </div>
+  </div>
   <div class="sep"></div>
   <button class="item" disabled={first.method === 'CONNECT'} onclick={() => (openTab(first.id), onclose())}>
     Send to Repeater{#if nav.view === 'history'} <kbd>R</kbd>{/if}
@@ -268,6 +277,41 @@
   }
   .sev:hover {
     filter: brightness(1.1);
+  }
+  .burst {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .burst .item {
+    flex: 1;
+    width: auto;
+  }
+  .gaps {
+    display: flex;
+    flex: none;
+    padding: 2px;
+    border-radius: 7px;
+    background: var(--field);
+  }
+  .gaps button {
+    min-width: 26px;
+    padding: 2px 5px;
+    border: 0;
+    border-radius: 5px;
+    background: none;
+    color: var(--text-2);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .gaps button.default {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 0 0 1px var(--hairline);
+  }
+  .gaps button:hover {
+    background: var(--accent);
+    color: #fff;
   }
   .item {
     display: flex;

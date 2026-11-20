@@ -4,6 +4,13 @@ export function time(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour12: false });
 }
 
+/** DD.MM.YYYY */
+export function date(ms: number): string {
+  const d = new Date(ms);
+  const two = (n: number) => String(n).padStart(2, '0');
+  return `${two(d.getDate())}.${two(d.getMonth() + 1)}.${d.getFullYear()}`;
+}
+
 export function bytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;

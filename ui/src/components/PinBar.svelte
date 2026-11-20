@@ -1,7 +1,7 @@
 <script lang="ts">
   // Lasting filters: "hide *mozilla*", "show only shop.test". They stay until
   // removed, and apply on top of whatever is typed in the main filter.
-  import { addPin, effectiveFilter, hasScope, history, idRange, live, setPins, setScopeOnly, type Pin } from '../lib/live.svelte';
+  import { addPin, effectiveFilter, hasScope, history, idRange, live, newestMatch, setPins, setScopeOnly, type Pin } from '../lib/live.svelte';
 
   // Exports exactly what History shows (main filter + chips).
   const harHref = $derived(`/api/export/har?filter=${encodeURIComponent(effectiveFilter())}`);
@@ -27,8 +27,8 @@
 
   // Clear: hide every request up to the newest # shown; new ones keep coming.
   // Nothing is deleted: remove the chip and they are back.
-  const newest = $derived(history.flows.reduce((a, f) => (!a || f.seq > a.seq ? f : a), history.flows[0]));
-  function clear() {
+  async function clear() {
+    const newest = await newestMatch();
     if (!newest) return;
     const pin: Pin = { text: `1-${newest.seq}`, mode: 'after', on: true, label: `#1–${newest.seq}` };
     setPins([...live.pins.filter((p) => p.mode !== 'after'), pin]);
@@ -75,7 +75,7 @@
       <input class="edit" bind:value={editText} onkeydown={editKey} onblur={() => (editing = null)} use:focus spellcheck="false" />
     {:else}
     <span class="pin {pin.mode}" class:off={!pin.on} oncontextmenu={(e) => startEdit(e, i)} role="group">
-      <button class="label" onclick={() => toggle(i)} title={pin.on ? 'Click to pause · right-click to change' : 'Paused: click to apply again · right-click to change'}>
+      <button class="label" onclick={() => toggle(i)} title="{pin.label ? `Filter: ${pin.text}\n` : ''}{pin.on ? 'Click to pause · right-click to change' : 'Paused: click to apply again · right-click to change'}">
         <span class="icon">{pin.mode === 'show' ? '✓' : '⊘'}</span>{pin.label ?? pin.text}
       </button>
       <button class="x" onclick={() => remove(i)} aria-label="Remove filter" title="Remove">×</button>
@@ -104,7 +104,7 @@
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="4" /></svg>
       In scope
     </button>
-    <button class="add" onclick={clear} disabled={!newest} title="Hide every request up to now; new ones keep appearing. Nothing is deleted: remove the chip to see them again.">Clear</button>
+    <button class="add" onclick={clear} disabled={!history.total} title="Hide every request up to now; new ones keep appearing. Nothing is deleted: remove the chip to see them again.">Clear</button>
   {/if}
   <a class="export" href={harHref} download title="Download the requests shown here as a HAR file (for browsers, Burp, ZAP)">Export HAR</a>
 </div>

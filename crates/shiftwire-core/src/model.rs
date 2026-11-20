@@ -88,6 +88,40 @@ pub struct AgentSeen {
     pub last_seen: u64,
 }
 
+/// One window of History (see `App::query_window`).
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryWindow {
+    pub rows: Vec<FlowSummary>,
+    /// Position of the first row (0 = first in the chosen order).
+    pub offset: usize,
+    /// How many flows match the filter.
+    pub total: u64,
+    /// Where the `around` flow is in the list (`None`: not asked for, or it does not match).
+    pub position: Option<usize>,
+}
+
+/// The run of requests one request belongs to: same actor, same way in, and no quiet
+/// gap longer than the limit between the end of one and the start of the next. HTTP
+/// has no id for "this click sent these requests"; this is the usual approximation.
+/// Every request by `actor` via `via` that started from `first_ts` to `last_ts` is in it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Burst {
+    pub actor: String,
+    pub via: String,
+    pub count: u64,
+    pub first_seq: u64,
+    pub first_ts: u64,
+    pub last_seq: u64,
+    pub last_ts: u64,
+    /// The gap that would end a burst (longer ones do).
+    pub gap_ms: u64,
+    /// The longest quiet gap inside it.
+    pub largest_gap_ms: u64,
+    /// The quiet before and after it (`None`: no other request by them before / after yet).
+    pub gap_before_ms: Option<u64>,
+    pub gap_after_ms: Option<u64>,
+}
+
 /// Which way a request came in, from its stored `source`: `proxy` (the proxy port),
 /// `browser` (the AI browser), `tunnel`, `repeater`, `mcp` (an agent's send_request /
 /// repeat_flow) or `invisible` (requests from the invisible proxy of earlier versions,

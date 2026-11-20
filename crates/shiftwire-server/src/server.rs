@@ -55,6 +55,7 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/api/flows/color", post(color_flows))
         .route("/api/flows/note", post(note_flows))
         .route("/api/flows/{id}/raw", get(flow_raw))
+        .route("/api/flows/{id}/burst", get(flow_burst))
         .route("/api/repeater/tabs", get(repeater_tabs).post(repeater_open))
         .route(
             "/api/repeater/tabs/{id}",
@@ -150,6 +151,15 @@ struct FlowsQuery {
     filter: Option<String>,
     /// Page backwards: only flows older than this id.
     before: Option<String>,
+    /// History's window: position of the first row (0 = first in `sort` order).
+    /// Without it (or past the end): the last page.
+    offset: Option<usize>,
+    /// A History column (`n`, `actor`, `via`, `method`, `host`, `path`, `status`,
+    /// `size`, `duration_ms`); `n` (time order) by default.
+    sort: Option<String>,
+    desc: Option<bool>,
+    /// Center the window on this flow if it matches (`X-Position` says where it is).
+    around: Option<String>,
 }
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
@@ -164,18 +174,41 @@ fn api_error(e: std::io::Error) -> (StatusCode, String) {
     (status, e.to_string())
 }
 
-/// The newest flows, oldest first. The UI loads these, then follows live events.
-/// A page of matching flows, oldest first; `X-Total-Count` is the number of all matches.
+/// A page of matching flows. `X-Total-Count` is the number of all matches and
+/// `X-Offset` the position of the first row returned: History shows every match
+/// and loads the rows in view by position.
 async fn flows(State(c): State<Ctx>, Query(q): Query<FlowsQuery>) -> ApiResult<impl IntoResponse> {
     let limit = q.limit.unwrap_or(1000).clamp(1, 100_000);
     let filter = Filter::parse(q.filter.as_deref().unwrap_or_default())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let flows = c
-        .app
-        .query_page(&filter, limit, q.before.as_deref())
-        .map_err(api_error)?;
-    let total = c.app.count_flows(&filter).map_err(api_error)?;
-    Ok(([("x-total-count", total.to_string())], Json(flows)))
+    let window = if let Some(before) = q.before.as_deref() {
+        let rows = c
+            .app
+            .query_page(&filter, limit, Some(before))
+            .map_err(api_error)?;
+        let total = c.app.count_flows(&filter).map_err(api_error)?;
+        shiftwire_core::HistoryWindow {
+            rows,
+            offset: 0,
+            total,
+            position: None,
+        }
+    } else {
+        let sort = q.sort.as_deref().unwrap_or("n");
+        let desc = q.desc.unwrap_or(false);
+        c.app
+            .query_window(&filter, sort, desc, q.offset, q.around.as_deref(), limit)
+            .map_err(api_error)?
+    };
+    let position = window.position.map_or(String::new(), |p| p.to_string());
+    Ok((
+        [
+            ("x-total-count", window.total.to_string()),
+            ("x-offset", window.offset.to_string()),
+            ("x-position", position),
+        ],
+        Json(window.rows),
+    ))
 }
 
 /// Who changes metadata through the REST API. Agents get their own name via MCP.
@@ -234,6 +267,29 @@ async fn flow(
 }
 
 /// A captured request as editable text (what "Send to Repeater" copies).
+#[derive(Deserialize)]
+struct BurstQuery {
+    /// A quiet gap longer than this ends the burst (default 2000).
+    gap_ms: Option<u64>,
+}
+
+/// The burst a flow belongs to: the run of requests by the same actor, the same way
+/// in, with no quiet gap longer than `gap_ms`.
+async fn flow_burst(
+    State(c): State<Ctx>,
+    Path(id): Path<String>,
+    Query(q): Query<BurstQuery>,
+) -> ApiResult<Json<shiftwire_core::Burst>> {
+    match c
+        .app
+        .burst(&id, q.gap_ms.unwrap_or(2000))
+        .map_err(api_error)?
+    {
+        Some(burst) => Ok(Json(burst)),
+        None => Err((StatusCode::NOT_FOUND, format!("no flow {id}"))),
+    }
+}
+
 async fn flow_raw(State(c): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     match c.app.flow_raw(&id).map_err(api_error)? {
         Some(raw) => Ok(Json(json!({ "raw": raw }))),

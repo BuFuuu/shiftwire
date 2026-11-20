@@ -26,7 +26,7 @@ export async function setAgentMode(mode: AgentMode): Promise<void> {
 /** Change rows locally right away; restore them if the server says no. */
 async function optimistic(ids: string[], change: (f: FlowSummary) => FlowSummary, send: () => Promise<void>) {
   const wanted = new Set(ids);
-  const before = history.flows.filter((f) => wanted.has(f.id));
+  const before = history.rows.filter((f) => f !== undefined && wanted.has(f.id)) as FlowSummary[];
   replaceFlows(before.map(change));
   try {
     await send();

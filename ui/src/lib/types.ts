@@ -200,3 +200,18 @@ export interface FlowDetail extends FlowSummary {
   request: Message;
   response: Message | null;
 }
+
+/** The run of requests one request belongs to (see shiftwire-core `Burst`). */
+export interface Burst {
+  actor: string;
+  via: string;
+  count: number;
+  first_seq: number;
+  first_ts: number;
+  last_seq: number;
+  last_ts: number;
+  gap_ms: number;
+  largest_gap_ms: number;
+  gap_before_ms: number | null;
+  gap_after_ms: number | null;
+}

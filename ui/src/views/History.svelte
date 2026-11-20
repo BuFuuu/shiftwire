@@ -6,16 +6,17 @@
   import PinBar from '../components/PinBar.svelte';
   import ViaBadge from '../components/ViaBadge.svelte';
   import Detail from './Detail.svelte';
-  import { history, live, loadOlder } from '../lib/live.svelte';
+  import { ensureRows, history, live, rowsIn, setSort, type SortKey } from '../lib/live.svelte';
   import { colorFlows } from '../lib/api';
   import { openTab } from '../lib/repeater.svelte';
   import { prefetch } from '../lib/detail';
-  import { bytes, statusClass, time } from '../lib/format';
+  import { burstLines } from '../lib/around';
+  import { bytes, date, statusClass, time } from '../lib/format';
   import { COLORS, type FlowSummary } from '../lib/types';
 
-  type SortKey = 'n' | 'actor' | 'via' | 'method' | 'host' | 'path' | 'status' | 'size' | 'duration_ms';
   const columns: { label: string; key: SortKey }[] = [
     { label: '#', key: 'n' },
+    { label: 'Date', key: 'n' },
     { label: 'Time', key: 'n' },
     { label: 'Actor', key: 'actor' },
     { label: 'Via', key: 'via' },
@@ -28,7 +29,6 @@
   ];
   const ROW = 26;
 
-  let sort = $state<{ key: SortKey; dir: 1 | -1 }>({ key: 'n', dir: 1 });
   /** The row shown in the detail pane. */
   let selected = $state<string | null>(null);
   /** All highlighted rows (Ctrl-click toggles, Shift-click extends); actions apply to these. */
@@ -36,25 +36,12 @@
   let rangeStart: string | null = null;
   let menu = $state<{ x: number; y: number; focus: 'tag' | 'note' | null } | null>(null);
   let viewport: HTMLDivElement | undefined = $state();
-  let follow = true; // stick to the newest row while scrolled to the bottom
 
-  // `history.flows` is already in time order; other orders are a sorted copy.
-  const view = $derived.by(() => {
-    const flows = history.flows;
-    if (sort.key === 'n') return sort.dir === 1 ? flows : flows.toReversed();
-    const k = sort.key;
-    const d = sort.dir;
-    return flows.toSorted((a, b) => {
-      const x = a[k] ?? -1;
-      const y = b[k] ?? -1;
-      return (x < y ? -1 : x > y ? 1 : 0) * d;
-    });
-  });
-  const timeOrder = $derived(sort.key === 'n' && sort.dir === 1);
-
-  function setSort(key: SortKey) {
-    sort = sort.key === key ? { key, dir: sort.dir === 1 ? -1 : 1 } : { key, dir: 1 };
-  }
+  /** Every match, sorted by the server; rows not loaded yet are `undefined`. */
+  const view = $derived(history.rows);
+  const sort = $derived(history.sort);
+  const timeOrder = $derived(sort.key === 'n' && !sort.desc);
+  const indexOf = (id: string | null) => (id ? view.findLastIndex((f) => f?.id === id) : -1);
 
   /** The request's own number in the project; filters never renumber rows. */
   const number = (f: FlowSummary) => f.seq;
@@ -64,13 +51,15 @@
     void colorFlows([f.id], f.color === 'purple' ? null : 'purple');
   }
 
-  function select(i: number, e?: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) {
-    const f = view[i];
+  async function select(i: number, e?: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) {
+    if (i < 0 || i >= view.length) return;
+    reveal(i);
+    const f = view[i] ?? (await rowsIn(i, i + 1))[0]; // a jump (End, PageDown) can land on rows not loaded yet
     if (!f) return;
-    const start = rangeStart ? view.findIndex((x) => x.id === rangeStart) : -1;
+    const start = indexOf(rangeStart);
     if (e?.shiftKey && start >= 0) {
       const [a, b] = start < i ? [start, i] : [i, start];
-      picked = new Set(view.slice(a, b + 1).map((x) => x.id));
+      picked = new Set((await rowsIn(a, b + 1)).map((x) => x.id));
     } else if (e?.metaKey || e?.ctrlKey) {
       const next = new Set(picked);
       if (!next.delete(f.id)) next.add(f.id);
@@ -82,11 +71,10 @@
     }
     selected = f.id;
     prefetch(view[i - 1]?.id, view[i + 1]?.id);
-    reveal(i);
   }
 
   function pickedFlows(): FlowSummary[] {
-    return view.filter((f) => picked.has(f.id));
+    return view.filter((f) => f !== undefined && picked.has(f.id)) as FlowSummary[];
   }
 
   function openMenu(x: number, y: number, focus: 'tag' | 'note' | null = null) {
@@ -95,13 +83,13 @@
 
   function onContextMenu(e: MouseEvent, i: number) {
     e.preventDefault();
-    if (!picked.has(view[i].id)) select(i);
+    if (!picked.has(view[i]!.id)) void select(i);
     openMenu(e.clientX, e.clientY);
   }
 
   /** Menu opened from the keyboard: next to the selected row. */
   function openMenuAtSelection(focus: 'tag' | 'note') {
-    const i = view.findIndex((f) => f.id === selected);
+    const i = indexOf(selected);
     if (!viewport || i < 0) return;
     const r = viewport.getBoundingClientRect();
     openMenu(r.left + 260, r.top + (i + 1) * ROW - viewport.scrollTop, focus);
@@ -121,15 +109,15 @@
     if (!viewport) return;
     const el = viewport;
     const observer = new ResizeObserver(() => {
-      if (follow && timeOrder) el.scrollTop = el.scrollHeight;
-      else if (selected) reveal(view.findIndex((f) => f.id === selected));
+      if (history.follow && timeOrder) el.scrollTop = el.scrollHeight;
+      else if (selected) reveal(indexOf(selected));
     });
     observer.observe(el);
     return () => observer.disconnect();
   });
 
   function onKey(e: KeyboardEvent) {
-    const current = selected ? view.findIndex((f) => f.id === selected) : -1;
+    const current = indexOf(selected);
     const page = Math.max(1, Math.floor((viewport?.clientHeight ?? ROW) / ROW) - 1);
     const moves: Record<string, number> = {
       ArrowDown: current + 1,
@@ -142,13 +130,13 @@
     const ids = [...picked];
     if (e.key in moves) {
       e.preventDefault();
-      select(Math.min(view.length - 1, moves[e.key]), { shiftKey: e.shiftKey, metaKey: false, ctrlKey: false });
+      void select(Math.min(view.length - 1, moves[e.key]), { shiftKey: e.shiftKey, metaKey: false, ctrlKey: false });
     } else if (e.key === 'Escape') {
       selected = null;
       picked = new Set();
     } else if ((e.metaKey || e.ctrlKey) && e.key === 'a') {
       e.preventDefault();
-      picked = new Set(view.map((f) => f.id));
+      void rowsIn(0, view.length).then((all) => (picked = new Set(all.map((f) => f.id))));
     } else if (e.metaKey || e.ctrlKey || e.altKey || !ids.length) {
       return; // leave browser and app shortcuts alone
     } else if (e.key >= '1' && e.key <= '7') {
@@ -157,7 +145,7 @@
       void colorFlows(ids, null);
     } else if (e.key === 'r' && selected) {
       e.preventDefault();
-      const flow = view.find((f) => f.id === selected);
+      const flow = view[indexOf(selected)];
       if (flow && flow.method !== 'CONNECT') void openTab(flow.id);
     } else if (e.key === 't' || e.key === 'n') {
       e.preventDefault();
@@ -165,19 +153,40 @@
     }
   }
 
-  async function onScroll() {
-    if (!viewport) return;
-    follow = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - ROW;
-    // Near the top in time order: fetch the previous page, keeping the view where it is.
-    if (timeOrder && viewport.scrollTop < 30 * ROW) {
-      const added = await loadOlder();
-      if (added) viewport.scrollTop += added * ROW;
-    }
+  // Burst lines left of the numbers, like Wireshark's related-packets line: thin
+  // for every burst in view, thicker for the selected row's. Time order only.
+  let range = $state({ first: 0, end: 0 });
+  const lines = $derived(
+    timeOrder ? burstLines(view, range.first - 300, range.end + 300, history.burstGap, selected) : new Map(),
+  );
+  $effect(() => {
+    history.selected = selected;
+  });
+
+  // A new filter or sort: the selected row stays in view (centered), if it still matches.
+  $effect(() => {
+    const r = history.reveal;
+    if (!r || !viewport) return;
+    history.reveal = null;
+    history.follow = false;
+    viewport.scrollTop = Math.max(0, r.index * ROW - viewport.clientHeight / 2 + ROW / 2);
+  });
+
+  /** Scrolled to the bottom: stick to the newest rows. */
+  function onScroll() {
+    if (viewport) history.follow = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - ROW;
+  }
+
+  /** Rows `first..end` are in view: remember where, and load them (and a margin) if needed. */
+  function onRange(first: number, end: number) {
+    history.viewStart = first;
+    if (first !== range.first || end !== range.end) range = { first, end };
+    void ensureRows(first - 50, end + 50);
   }
 
   $effect(() => {
     void view.length;
-    if (follow && timeOrder && viewport) viewport.scrollTop = viewport.scrollHeight;
+    if (history.follow && timeOrder && viewport) viewport.scrollTop = viewport.scrollHeight;
   });
 </script>
 
@@ -185,12 +194,12 @@
   <PinBar />
   <div class="head">
     {#each columns as c, i (i)}
-      <button class:active={sort.key === c.key && c.label !== 'Time'} onclick={() => setSort(c.key)}>
-        {c.label}{#if sort.key === c.key && c.label !== 'Time'}<span class="arrow">{sort.dir === 1 ? '▲' : '▼'}</span>{/if}
+      <button class:active={sort.key === c.key && c.label !== 'Time' && c.label !== 'Date'} onclick={() => setSort(c.key)}>
+        {c.label}{#if sort.key === c.key && c.label !== 'Time' && c.label !== 'Date'}<span class="arrow">{sort.desc ? '▼' : '▲'}</span>{/if}
       </button>
     {/each}
   </div>
-  {#if history.flows.length === 0}
+  {#if history.total === 0 && !live.status?.flows}
     <div class="empty">
       <Icon name="radar" size={40} />
       <h2>Waiting for traffic</h2>
@@ -211,7 +220,7 @@
   {:else}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div class="rows" tabindex="0" role="grid" aria-label="Requests" onkeydown={onKey}>
-      <VirtualList items={view} key={(f) => f.id} rowHeight={ROW} bind:viewport onscroll={onScroll}>
+      <VirtualList items={view} key={(f) => f.id} rowHeight={ROW} bind:viewport onscroll={onScroll} onrange={onRange}>
         {#snippet row(f: FlowSummary, i: number)}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <div
@@ -227,7 +236,12 @@
             ondblclick={() => toggleMark(f)}
             oncontextmenu={(e) => onContextMenu(e, i)}
           >
+            {#if lines.get(i)}
+              {@const line = lines.get(i)!}
+              <span class="burst {line.kind}" class:sel={line.selected}></span>
+            {/if}
             <span class="num">{number(f)}</span>
+            <span class="num">{date(f.ts)}</span>
             <span class="num">{time(f.ts)}</span>
             <span><span class="actor" class:ai={f.actor !== 'proxy'}>{f.actor}</span></span>
             <span><ViaBadge flow={f} /></span>
@@ -320,7 +334,45 @@
     font-size: 8px;
   }
   .row {
+    position: relative;
     height: 26px;
+  }
+  /* Burst lines: ┌ first member, ├ member, └ last, │ someone else's row inside. */
+  .burst {
+    position: absolute;
+    left: 6px;
+    top: 0;
+    bottom: 0;
+    width: 5px;
+    color: color-mix(in srgb, var(--accent) 55%, transparent);
+    border-left: 1px solid currentColor;
+    pointer-events: none;
+  }
+  .burst.start {
+    top: 50%;
+    border-top: 1px solid currentColor;
+  }
+  .burst.end {
+    bottom: 50%;
+    border-bottom: 1px solid currentColor;
+  }
+  .burst.mid::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 4px;
+    border-top: 1px solid currentColor;
+  }
+  .burst.sel {
+    color: var(--accent);
+    border-width: 2.5px;
+  }
+  .burst.sel.mid::after {
+    border-top-width: 2px;
+  }
+  .row.picked .burst {
+    color: #fff;
   }
   .row.odd {
     background: var(--stripe);

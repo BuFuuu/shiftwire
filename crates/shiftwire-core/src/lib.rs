@@ -33,8 +33,8 @@ pub use events::Event;
 pub use filter::{Filter, FilterError};
 pub use masking::{MaskLevel, MaskSite, Masker, Masking};
 pub use model::{
-    AgentMode, AgentSeen, BodyView, BrowserStatus, COLORS, Flow, FlowDetail, FlowSummary, McpCall,
-    Message, RepeaterTab, SEVERITIES, Status, TimelineEntry,
+    AgentMode, AgentSeen, BodyView, BrowserStatus, Burst, COLORS, Flow, FlowDetail, FlowSummary,
+    HistoryWindow, McpCall, Message, RepeaterTab, SEVERITIES, Status, TimelineEntry,
 };
 pub use project::{Project, ProjectInfo};
 pub use rules::{Rule, RuleMode, RulePart};
@@ -322,6 +322,21 @@ impl App {
             .map_err(io::Error::other)
     }
 
+    /// A window of History in any column order; see `Store::query_window`.
+    pub fn query_window(
+        &self,
+        filter: &Filter,
+        sort: &str,
+        desc: bool,
+        offset: Option<usize>,
+        around: Option<&str>,
+        limit: usize,
+    ) -> io::Result<HistoryWindow> {
+        self.store()
+            .query_window(filter, sort, desc, offset, around, limit)
+            .map_err(io::Error::other)
+    }
+
     pub fn count_flows(&self, filter: &Filter) -> io::Result<u64> {
         self.store()
             .count_matching(filter)
@@ -375,6 +390,11 @@ impl App {
             .set_field(ids, "note", value)
             .map_err(io::Error::other)?;
         self.emit_updated(ids)
+    }
+
+    /// The burst flow `id` belongs to (see [`Burst`]).
+    pub fn burst(&self, id: &str, gap_ms: u64) -> io::Result<Option<Burst>> {
+        self.store().burst(id, gap_ms).map_err(io::Error::other)
     }
 
     /// Editor text for a captured request, ready for the Repeater.
