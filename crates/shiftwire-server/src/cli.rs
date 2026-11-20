@@ -79,6 +79,12 @@ pub fn status(paths: &Paths) -> Result<()> {
         );
     }
     println!("  proxy    {proxy}");
+    if let Some(error) = &s.mcp_error {
+        println!("  MCP      DOWN: {error}");
+    }
+    if let Some(binary) = &s.browser.binary {
+        println!("  browser  open ({binary})");
+    }
     println!(
         "  flows    {}   agents {}   agent mode: {}",
         s.flows,
@@ -153,7 +159,7 @@ fn print_urls(state: &State) {
     println!("  UI       {}", state.api_url);
     println!(
         "  MCP      {}/mcp?agent=NAME   (or: shiftwire mcp --agent NAME)",
-        state.api_url
+        state.mcp_url
     );
 }
 

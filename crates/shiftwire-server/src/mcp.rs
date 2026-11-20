@@ -6,9 +6,12 @@
 //!
 //! Target content (headers, bodies, URLs) is framed as untrusted, so an agent
 //! can tell page text from instructions (prompt-injection defence).
+//!
+//! Every request (except pings and notifications) goes to the MCP log with
+//! exactly the reply the agent got, for the operator's AI Timeline.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -16,7 +19,9 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use shiftwire_core::{AgentMode, App, Edits, Filter, FlowDetail, FlowSummary, Message, Target};
+use shiftwire_core::{
+    AgentMode, App, Edits, Filter, FlowDetail, FlowSummary, Masker, McpCall, Message, Target,
+};
 
 use crate::daemon;
 use crate::server::Ctx;
@@ -33,6 +38,7 @@ How to send requests (act mode):
 - Single, deliberate requests: use send_request / repeat_flow. Scope is checked before anything is sent, you can tag and note in the same call, and the response comes back to you here.
 - Tools that need a proxy (ffuf, sqlmap, nuclei, a browser): route them through the proxy from proxy_info. Their requests also appear under your name.
 - open_in_repeater hands a request to the operator's Repeater, to show them something or let them take over by hand.
+- browser_* tools steer the AI browser, a real browser the operator opens for you and shares with you (logins, SSO, JavaScript apps). Look with browser_snapshot, act on the refs it gives. Its requests appear under your name. browser_navigate is limited to the scope; in advise mode only looking tools work.
 Rules:
 - You may only touch hosts in scope (get_scope). Out-of-scope or paused requests are refused and shown to the operator. Ask the operator to extend the scope; you cannot change it.
 - Before each step, say what you are about to test with log_intent (one line). Your requests that follow are grouped under it on the operator's AI Timeline and carry its id: tag_flows/set_note with filter intent:<id> then cover exactly that run (no need to re-derive it from a wordlist).
@@ -57,17 +63,20 @@ pub async fn post(
 ) -> Response {
     let msg: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => return rpc_error(Value::Null, -32700, &format!("parse error: {e}")),
+        Err(e) => {
+            return rpc_error(Value::Null, -32700, &format!("parse error: {e}")).into_response();
+        }
     };
     let Some(id) = msg.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response(); // a notification: nothing to answer
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    match msg
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
+    let method = msg["method"].as_str().unwrap_or_default().to_string();
+    let started = Instant::now();
+    let mut agent = session_agent(&c, &headers, &q);
+    let mut session = None;
+    // The reply, and what the MCP log shows of it.
+    let (reply, shown, is_error) = match method.as_str() {
         "initialize" => {
             let requested = params["protocolVersion"].as_str().unwrap_or_default();
             let version = PROTOCOL_VERSIONS
@@ -75,12 +84,13 @@ pub async fn post(
                 .find(|v| **v == requested)
                 .unwrap_or(&PROTOCOL_VERSIONS[0]);
             let client = params["clientInfo"]["name"].as_str().unwrap_or("agent");
-            let agent = agent_name(q.agent.as_deref().unwrap_or(client));
-            let session = daemon::new_token();
+            agent = agent_name(q.agent.as_deref().unwrap_or(client));
+            let token = daemon::new_token();
             c.mcp_sessions
                 .lock()
                 .expect("sessions lock")
-                .insert(session.clone(), agent.clone());
+                .insert(token.clone(), agent.clone());
+            session = Some(token);
             c.app.touch_agent(&agent);
             let result = json!({
                 "protocolVersion": version,
@@ -88,46 +98,204 @@ pub async fn post(
                 "serverInfo": { "name": "shiftwire", "version": shiftwire_core::VERSION },
                 "instructions": INSTRUCTIONS,
             });
-            ([(SESSION_HEADER, session)], rpc_ok(id, result)).into_response()
+            let shown = pretty(&result);
+            (rpc_ok(id, result), shown, false)
         }
-        "ping" => rpc_ok(id, json!({})).into_response(),
-        "tools/list" => rpc_ok(id, json!({ "tools": tools() })).into_response(),
+        "ping" => return rpc_ok(id, json!({})).into_response(),
+        "tools/list" => {
+            let mut tools = tools();
+            match c.playwright.tools(c.app.browser().cdp_port).await {
+                Ok(browser) => tools.as_array_mut().expect("a list").extend(browser),
+                Err(e) => tracing::debug!("no browser tools: {e}"),
+            }
+            let names: Vec<&str> = tools
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["name"].as_str())
+                .collect();
+            let shown = format!("{} tools: {}", names.len(), names.join(", "));
+            (rpc_ok(id, json!({ "tools": tools })), shown, false)
+        }
         "tools/call" => {
-            let agent = session_agent(&c, &headers, &q);
             let name = params["name"].as_str().unwrap_or_default();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let (mut text, is_error) = match call(&c.app, &agent, name, &args).await {
-                Ok(text) => (text, false),
-                Err(e) => (e, true),
-            };
-            // A mode switch and the operator's messages reach the agent with whatever it does next.
-            if let Some(mode) = c.app.mode_news(&agent) {
-                let what = match mode {
-                    AgentMode::Act => "you may send requests within the scope again.",
-                    AgentMode::Advise => {
-                        "do not send requests; prepare them with prepare_request for the operator."
-                    }
-                    AgentMode::Off => {
-                        "all your requests are refused until the operator turns you back on."
-                    }
-                };
-                text.push_str(&format!(
-                    "\n\n⚙ The operator switched AI mode to \"{}\": {what}",
-                    mode.as_str()
-                ));
-            }
-            if let Ok(messages) = c.app.unread_operator_messages(&agent) {
-                for m in messages {
-                    text.push_str(&format!("\n\n📣 Message from the operator: {}", m.text));
-                }
-            }
-            rpc_ok(
-                id,
-                json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
-            )
-            .into_response()
+            let (content, is_error) = tool_call(&c, &agent, name, &args).await;
+            let shown = content
+                .iter()
+                .map(|item| match item["text"].as_str() {
+                    Some(text) => text.to_string(),
+                    None => format!(
+                        "[{} {}]",
+                        item["type"].as_str().unwrap_or("item"),
+                        item["mimeType"].as_str().unwrap_or_default()
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = json!({ "content": content, "isError": is_error });
+            (rpc_ok(id, result), shown, is_error)
         }
-        other => rpc_error(id, -32601, &format!("method not found: {other}")),
+        other => {
+            let message = format!("method not found: {other}");
+            (rpc_error(id, -32601, &message), message, true)
+        }
+    };
+    let (tool, request) = match method.as_str() {
+        "tools/call" => (
+            params["name"].as_str().map(str::to_string),
+            pretty(params.get("arguments").unwrap_or(&json!({}))),
+        ),
+        _ => (None, pretty(&params)),
+    };
+    let logged = c.app.record_mcp_call(McpCall {
+        id: String::new(), // the core assigns id and time
+        ts: 0,
+        agent,
+        method,
+        tool,
+        request,
+        response: shown,
+        is_error,
+        duration_ms: started.elapsed().as_millis() as u64,
+        request_size: 0,
+        response_size: 0,
+        color: None,
+    });
+    if let Err(e) = logged {
+        tracing::warn!("MCP log: {e}");
+    }
+    match session {
+        Some(token) => ([(SESSION_HEADER, token)], reply).into_response(),
+        None => reply.into_response(),
+    }
+}
+
+fn pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_default()
+}
+
+/// Everything an agent sends to a tool and gets back passes through here, and only
+/// here: the place to filter what agents see (e.g. masking target names) later.
+async fn tool_call(c: &Ctx, agent: &str, name: &str, args: &Value) -> (Vec<Value>, bool) {
+    let app = &c.app;
+    app.touch_agent(agent); // "last seen" in the status bar
+    // Masking: the agent writes aliases, the tools get real names (see `mask_reply`).
+    let masker = app.masker();
+    let args = &masker.inbound(args);
+    let unmaskable = matches!(name, "browser_take_screenshot" | "browser_evaluate");
+    let (mut content, is_error) = if masker.hides_images() && unmaskable {
+        (
+            vec![text_item(format!(
+                "{name} is off while masking is on (shiftWire cannot mask what it returns). Use browser_snapshot or browser_find."
+            ))],
+            true,
+        )
+    } else if name.starts_with("browser_") {
+        browser_call(c, agent, name, args).await
+    } else {
+        match call(app, agent, name, args).await {
+            Ok(text) => (vec![text_item(text)], false),
+            Err(e) => (vec![text_item(e)], true),
+        }
+    };
+    let mut text = String::new();
+    // A mode switch and the operator's messages reach the agent with whatever it does next.
+    if let Some(mode) = app.mode_news(agent) {
+        let what = match mode {
+            AgentMode::Act => "you may send requests within the scope again.",
+            AgentMode::Advise => {
+                "do not send requests; prepare them with prepare_request for the operator."
+            }
+            AgentMode::Off => "all your requests are refused until the operator turns you back on.",
+        };
+        text.push_str(&format!(
+            "\n\n⚙ The operator switched AI mode to \"{}\": {what}",
+            mode.as_str()
+        ));
+    }
+    if let Ok(messages) = app.unread_operator_messages(agent) {
+        for m in messages {
+            text.push_str(&format!("\n\n📣 Message from the operator: {}", m.text));
+        }
+    }
+    // Appended to the reply's last text, as agents read it (or as its own item).
+    if !text.is_empty() {
+        match content.iter_mut().rev().find_map(|i| i.get_mut("text")) {
+            Some(Value::String(last)) => last.push_str(&text),
+            _ => content.push(text_item(text.trim_start().to_string())),
+        }
+    }
+    let reply = mask_reply(&masker, content);
+    app.keep_mask_aliases(); // Strict: other hosts it met keep their aliases
+    (reply, is_error)
+}
+
+/// Masking, outbound: every text the agent gets passes here last. At the content level,
+/// images are withheld (shiftWire cannot mask pixels).
+fn mask_reply(masker: &Masker, content: Vec<Value>) -> Vec<Value> {
+    if !masker.active() {
+        return content;
+    }
+    content
+        .into_iter()
+        .map(|item| match item["text"].as_str() {
+            Some(text) => text_item(masker.outbound(text)),
+            None if masker.hides_images() => text_item("[image withheld: masking is on]".into()),
+            None => item,
+        })
+        .collect()
+}
+
+fn text_item(text: String) -> Value {
+    json!({ "type": "text", "text": text })
+}
+
+/// An agent's browser tool: allowed, mode and scope checked, then run by Playwright
+/// in the AI browser, with the requests it sets off attributed to the agent.
+async fn browser_call(c: &Ctx, agent: &str, name: &str, args: &Value) -> (Vec<Value>, bool) {
+    let refuse = |why: String| (vec![text_item(why)], true);
+    if !crate::playwright::allowed(name) {
+        return refuse(format!("unknown tool {name}"));
+    }
+    let looking = crate::playwright::READ_ONLY.contains(&name)
+        || (name == "browser_tabs" && args["action"].as_str() == Some("list"));
+    match c.app.agent_mode() {
+        AgentMode::Off => return refuse("blocked: the operator has paused all AI agents".into()),
+        AgentMode::Advise if !looking => {
+            return refuse("blocked: shiftWire is in advise mode: you may look at the AI browser (browser_snapshot, browser_find, browser_take_screenshot, browser_console_messages, browser_tabs list), not act in it.".into());
+        }
+        _ => {}
+    }
+    if let Some(url) = args["url"].as_str() {
+        let host = url
+            .parse::<Uri>()
+            .ok()
+            .and_then(|u| u.host().map(|h| h.trim_matches(['[', ']']).to_string()))
+            .unwrap_or_default();
+        if let Err(e) = c.app.agent_allowed(agent, &host) {
+            return refuse(format!("{e} ({url})"));
+        }
+    }
+    let Some(cdp_port) = c.app.browser().cdp_port else {
+        return refuse("The AI browser is not open. Ask the operator to open it (status bar → AI browser → Open).".into());
+    };
+    c.app.begin_browser_action(agent);
+    let result = c.playwright.call(cdp_port, name, args).await;
+    c.app.end_browser_action(agent);
+    match result {
+        // Page content comes from the target: framed as untrusted, like every flow.
+        Ok((content, is_error)) => {
+            let framed = content
+                .into_iter()
+                .map(|item| match item["text"].as_str() {
+                    Some(text) => text_item(untrusted(text)),
+                    None => item,
+                })
+                .collect();
+            (framed, is_error)
+        }
+        Err(e) => refuse(e),
     }
 }
 
@@ -135,9 +303,8 @@ fn rpc_ok(id: Value, result: Value) -> Json<Value> {
     Json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-fn rpc_error(id: Value, code: i32, message: &str) -> Response {
+fn rpc_error(id: Value, code: i32, message: &str) -> Json<Value> {
     Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))
-        .into_response()
 }
 
 /// `Claude Code` -> `claude-code`; never `proxy` or `human`.
@@ -482,6 +649,13 @@ async fn call(app: &App, agent: &str, name: &str, args: &Value) -> Result<String
 
 fn proxy_info(app: &App, agent: &str) -> String {
     let status = app.status();
+    if app.masker().active() {
+        return format!(
+            "You are \"{agent}\". The operator turned masking on: target names you see are stand-ins (like target1.masked) that work only through these MCP tools. Send requests with send_request / repeat_flow and use the browser_* tools; do not route tools through a proxy (refused while masking is on).\nScope: {}\nMode: {}",
+            app.scope().describe(),
+            status.agent_mode.as_str()
+        );
+    }
     let proxy = format!("http://{agent}:x@{}", status.proxy_addr);
     let ca = std::path::Path::new(&status.data_dir)
         .join("ca")

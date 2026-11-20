@@ -9,6 +9,8 @@
   import { nav } from './lib/nav.svelte';
   import Toolbar from './components/Toolbar.svelte';
   import History from './views/History.svelte';
+  import StatusBar from './components/StatusBar.svelte';
+  import McpLog from './views/McpLog.svelte';
 
 
   const titles: Record<View, string> = {
@@ -46,12 +48,13 @@
       {:else if nav.view === 'settings'}
         <Settings />
       {:else if nav.view === 'timeline'}
-        <Timeline />
+        {#if nav.aiTab === 'mcp'}<McpLog />{:else}<Timeline />{/if}
       {:else if nav.view === 'sitemap'}
         <SiteMap />
       {/if}
     </div>
   </main>
+  <StatusBar />
 </div>
 <Toast />
 
@@ -59,7 +62,7 @@
   .shell {
     display: grid;
     grid-template-columns: 210px 1fr;
-    grid-template-rows: minmax(0, 1fr); /* don't grow with content; panes scroll */
+    grid-template-rows: minmax(0, 1fr) auto; /* don't grow with content; panes scroll */
     height: 100vh;
   }
   main {

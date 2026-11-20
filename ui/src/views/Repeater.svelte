@@ -1,5 +1,8 @@
 <script lang="ts">
   import HttpMessage from '../components/HttpMessage.svelte';
+  import TextMenu, { type MenuItem } from '../components/TextMenu.svelte';
+  import { base64Decode, base64Encode, copyText, urlDecode, urlEncode } from '../lib/text';
+  import { curlOf, flowUrl } from '../lib/curl';
   import SideSplit from '../components/SideSplit.svelte';
   import ContextMenu from '../components/ContextMenu.svelte';
   import { getDetail } from '../lib/detail';
@@ -31,12 +34,89 @@
   let problem = $state<string | null>(null);
   let renaming = $state(false);
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let editor: HTMLTextAreaElement | undefined = $state();
+  let textMenu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
+
+  /** Replaces the editor's selection (e.g. with its URL-encoded form) and keeps it selected. */
+  function replaceSelection(convert: (s: string) => string) {
+    if (!editor) return;
+    const { selectionStart: a, selectionEnd: b } = editor;
+    const out = convert(draft.slice(a, b));
+    draft = draft.slice(0, a) + out + draft.slice(b);
+    scheduleSave();
+    requestAnimationFrame(() => {
+      editor?.focus();
+      editor?.setSelectionRange(a, a + out.length);
+    });
+  }
+
+  /** The editor's request as method, URL, headers and body. */
+  function parsedDraft() {
+    const lines = draft.split(NL);
+    const [method = 'GET', path = '/'] = (lines[0] ?? '').split(' ');
+    const end = lines.indexOf('', 1);
+    const head = lines.slice(1, end === -1 ? undefined : end);
+    const headers = head
+      .map((l) => [l.slice(0, l.indexOf(':')).trim(), l.slice(l.indexOf(':') + 1).trim()] as [string, string])
+      .filter(([n]) => n);
+    const body = end === -1 ? '' : lines.slice(end + 1).join(NL);
+    return { method, url: flowUrl({ ...target, path }), headers, body };
+  }
+
+  function editorMenu(e: MouseEvent) {
+    e.preventDefault();
+    const sel = editor ? draft.slice(editor.selectionStart, editor.selectionEnd) : '';
+    textMenu = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: 'Cut', hint: 'Ctrl+X', disabled: !sel, action: () => (void copyText(sel), replaceSelection(() => '')) },
+        { label: 'Copy', hint: 'Ctrl+C', disabled: !sel, action: () => copyText(sel) },
+        {
+          label: 'Paste',
+          hint: 'Ctrl+V',
+          action: async () => {
+            try {
+              const text = await navigator.clipboard.readText();
+              replaceSelection(() => text.replaceAll(String.fromCharCode(13), ''));
+            } catch {
+              editor?.focus(); // no clipboard permission: Ctrl+V still works
+            }
+          },
+        },
+        { label: 'Select all', hint: 'Ctrl+A', action: () => (editor?.focus(), editor?.select()) },
+        null,
+        { label: 'URL-encode selection', disabled: !sel, action: () => replaceSelection(urlEncode) },
+        { label: 'URL-decode selection', disabled: !sel, action: () => replaceSelection(urlDecode) },
+        { label: 'Base64-encode selection', disabled: !sel, action: () => replaceSelection(base64Encode) },
+        { label: 'Base64-decode selection', disabled: !sel, action: () => replaceSelection(base64Decode) },
+        null,
+        { label: 'Copy URL', action: () => copyText(parsedDraft().url) },
+        {
+          label: 'Copy as curl',
+          action: () => {
+            const r = parsedDraft();
+            return copyText(curlOf(r.method, r.url, r.headers, r.body));
+          },
+        },
+      ],
+    };
+  }
+
+  /** Extra items in the response pane's right-click menu. */
+  const responseExtras = (x: number, y: number): MenuItem[] =>
+    result
+      ? [
+          { label: 'Copy URL', action: () => copyText(flowUrl(result!)) },
+          { label: 'Color, tags, mark, filter…', action: () => (menu = { x, y }) },
+        ]
+      : [];
 
   // Switching tabs (or a tab arriving): load it into the editor.
   $effect(() => {
     if (!tab || tab.id === shownId) return;
     shownId = tab.id;
-    draft = tab.raw;
+    draft = tab.raw.replaceAll(String.fromCharCode(13), ''); // older tabs may hold CRLF
     target = { ...tab.target };
     viewing = -1;
     problem = null;
@@ -162,7 +242,9 @@
           <!-- Colors drawn behind a transparent textarea: plain editing, highlighted text. -->
           <pre bind:this={colors} aria-hidden="true">{@html highlightRequest(draft) + NL}</pre>
           <textarea
+            bind:this={editor}
             bind:value={draft}
+            oncontextmenu={editorMenu}
             oninput={scheduleSave}
             onscroll={(e) => colors && ((colors.scrollTop = e.currentTarget.scrollTop), (colors.scrollLeft = e.currentTarget.scrollLeft))}
             spellcheck="false"
@@ -185,7 +267,7 @@
             {#if result.redirects}· after {result.redirects} redirect{result.redirects === 1 ? '' : 's'}: <span class="final">{result.host}{result.path}</span>{/if}
             {#if result.error}<span class="err">{result.error}</span>{/if}
           </div>
-          <HttpMessage title="Response" pane="response" message={result.response} />
+          <HttpMessage title="Response" pane="response" message={result.response} extra={responseExtras} />
         {:else}
           <p class="waiting">{sending ? 'Waiting for the response…' : 'Send the request to see the response here.'}</p>
         {/if}
@@ -195,6 +277,10 @@
     </div>
   {/if}
 </section>
+
+{#if textMenu}
+  <TextMenu x={textMenu.x} y={textMenu.y} items={textMenu.items} onclose={() => (textMenu = null)} />
+{/if}
 
 {#if menu && result}
   <ContextMenu x={menu.x} y={menu.y} flows={[result]} onclose={() => (menu = null)} />

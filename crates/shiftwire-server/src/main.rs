@@ -11,6 +11,7 @@ mod har;
 mod mcp;
 mod mcp_bridge;
 mod open;
+mod playwright;
 mod server;
 mod ui;
 mod ws;

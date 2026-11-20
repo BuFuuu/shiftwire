@@ -4,10 +4,12 @@
 //! (REST, WebSocket, MCP, CLI) call `App` and listen on its event bus, so the
 //! human and the AI always see the same state.
 
+mod browser;
 pub mod config;
 mod decode;
 pub mod events;
 pub mod filter;
+pub mod masking;
 pub mod model;
 pub mod project;
 mod proxy;
@@ -18,7 +20,7 @@ pub mod sitemap;
 mod store;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
@@ -29,9 +31,10 @@ use tokio::sync::{broadcast, watch};
 pub use config::Config;
 pub use events::Event;
 pub use filter::{Filter, FilterError};
+pub use masking::{MaskLevel, MaskSite, Masker, Masking};
 pub use model::{
-    AgentMode, BodyView, COLORS, Flow, FlowDetail, FlowSummary, Message, RepeaterTab, SEVERITIES,
-    Status, TimelineEntry,
+    AgentMode, AgentSeen, BodyView, BrowserStatus, COLORS, Flow, FlowDetail, FlowSummary, McpCall,
+    Message, RepeaterTab, SEVERITIES, Status, TimelineEntry,
 };
 pub use project::{Project, ProjectInfo};
 pub use rules::{Rule, RuleMode, RulePart};
@@ -40,6 +43,10 @@ pub use sender::{Edits, Target};
 pub use sitemap::Endpoint;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// MCP log: what is stored of each request and response, and what lists show of them.
+const MCP_LOG_MAX: usize = 256 * 1024;
+const MCP_PREVIEW: usize = 300;
 
 /// Cheap to clone; all clones share the same state.
 #[derive(Clone)]
@@ -74,8 +81,30 @@ struct Inner {
     mode_seen: Mutex<std::collections::HashMap<String, AgentMode>>,
     proxy_running: AtomicBool,
     proxy_error: Mutex<Option<String>>,
+    /// Open client connections on the proxy port, and its latest request (unix ms).
+    proxy_connections: AtomicU64,
+    proxy_last_request: AtomicU64,
+    /// The MCP listener is served by the server crate; it reports its state here.
+    mcp_running: AtomicBool,
+    mcp_error: Mutex<Option<String>>,
     /// Required from non-local proxy clients when set (the proxy listens publicly).
     proxy_password: Mutex<Option<String>>,
+    /// The AI browser while it runs; `browser_error` says why it could not open.
+    browser: Mutex<Option<OpenBrowser>>,
+    browser_error: Mutex<Option<String>>,
+    /// The agent driving the AI browser and until when (unix ms; `u64::MAX` while its
+    /// tool call runs). Requests the browser sends meanwhile are the agent's.
+    browser_driver: Mutex<Option<(String, u64)>>,
+    /// The project's masking settings and their ready translation.
+    masking: RwLock<(Masking, Arc<Masker>)>,
+}
+
+/// A running AI browser: what to show, and how to close it.
+struct OpenBrowser {
+    binary: String,
+    proxy_port: u16,
+    cdp_port: u16,
+    close: tokio::sync::mpsc::Sender<()>,
 }
 
 impl App {
@@ -126,7 +155,18 @@ impl App {
             mode_seen: Mutex::default(),
             proxy_running: AtomicBool::new(false),
             proxy_error: Mutex::new(None),
+            proxy_connections: AtomicU64::new(0),
+            proxy_last_request: AtomicU64::new(0),
+            mcp_running: AtomicBool::new(false),
+            mcp_error: Mutex::new(None),
             proxy_password: Mutex::new(None),
+            browser: Mutex::default(),
+            browser_error: Mutex::default(),
+            browser_driver: Mutex::default(),
+            masking: RwLock::new((
+                Masking::default(),
+                Arc::new(Masker::new(&Masking::default())),
+            )),
         };
         let app = Self {
             inner: Arc::new(inner),
@@ -204,6 +244,7 @@ impl App {
                 .expect("agents_read lock")
                 .clear();
             self.load_scope()?;
+            self.close_browser(); // its profile belongs to the old project
         }
         self.inner.recent.record(&project.path);
         self.inner.bus.emit(Event::ProjectChanged {
@@ -228,6 +269,7 @@ impl App {
 
     pub fn status(&self) -> Status {
         let i = &self.inner;
+        let agent_list = self.active_agents();
         Status {
             version: VERSION.into(),
             pid: std::process::id(),
@@ -240,12 +282,20 @@ impl App {
             proxy_addr: i.config.proxy_addr.to_string(),
             proxy_running: i.proxy_running.load(Ordering::Relaxed),
             proxy_error: i.proxy_error.lock().expect("proxy_error lock").clone(),
+            proxy_connections: i.proxy_connections.load(Ordering::Relaxed),
+            proxy_last_request: i.proxy_last_request.load(Ordering::Relaxed),
+            mcp_addr: i.config.mcp_addr.to_string(),
+            mcp_running: i.mcp_running.load(Ordering::Relaxed),
+            mcp_error: i.mcp_error.lock().expect("mcp_error lock").clone(),
             ca_fingerprint: i.ca.fingerprint().to_string(),
             flows: self.store().count(),
             dropped: self.store().dropped(),
-            agents: self.active_agents(),
+            agents: agent_list.len() as u32,
+            agent_list,
             ai_paused: self.ai_paused(),
             agent_mode: self.agent_mode(),
+            browser: self.browser(),
+            masking: self.masking(),
         }
     }
 
@@ -393,7 +443,7 @@ impl App {
             tab.name = name;
         }
         if let Some(raw) = raw {
-            tab.raw = raw;
+            tab.raw = editor_text(&raw);
         }
         self.save_tab(&tab)?;
         Ok(tab)
@@ -514,6 +564,18 @@ impl App {
         *self.inner.proxy_error.lock().expect("proxy_error lock") = error;
     }
 
+    /// The server reports whether the MCP listener runs, or why not (e.g. port in use).
+    pub fn set_mcp_state(&self, running: bool, error: Option<String>) {
+        self.inner.mcp_running.store(running, Ordering::Relaxed);
+        *self.inner.mcp_error.lock().expect("mcp_error lock") = error;
+    }
+
+    /// Counts a proxy client connection until the returned guard is dropped.
+    pub(crate) fn proxy_connection(&self) -> ConnectionGuard {
+        self.inner.proxy_connections.fetch_add(1, Ordering::Relaxed);
+        ConnectionGuard(self.clone())
+    }
+
     // ---- Agents: scope, kill switch, attribution ------------------------------
 
     pub fn scope(&self) -> Scope {
@@ -530,6 +592,11 @@ impl App {
             .set_setting("scope.exclude", &scope.exclude.join("\n"))
             .map_err(io::Error::other)?;
         *self.inner.scope.lock().expect("scope lock") = scope.clone();
+        let masker = self.masker();
+        for host in &scope.include {
+            masker.learn(host); // Strict: new scope hosts get aliases right away
+        }
+        self.keep_mask_aliases();
         self.inner.bus.emit(Event::ScopeChanged {
             scope: scope.clone(),
         });
@@ -550,6 +617,11 @@ impl App {
             exclude: read("scope.exclude")?,
         };
         *self.inner.scope.lock().expect("scope lock") = scope;
+        let masking = match self.store().setting("masking").map_err(io::Error::other)? {
+            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+            None => Masking::default(),
+        };
+        self.use_masking(masking);
         let mode = match self
             .store()
             .setting("agents.mode")
@@ -598,9 +670,10 @@ impl App {
     }
 
     /// An alert rule fired on a request passing the proxy.
-    pub(crate) fn rule_alert(&self, rule: &str, flow: &Flow) {
+    pub(crate) fn rule_alert(&self, rule: &str, flow: &Flow, blocked: bool) {
         self.inner.bus.emit(Event::RuleAlert {
             rule: rule.to_string(),
+            blocked,
             flow_id: flow.id.clone(),
             seq: flow.seq,
             method: flow.method.clone(),
@@ -644,15 +717,23 @@ impl App {
             .insert(name.to_string(), now_ms());
     }
 
-    fn active_agents(&self) -> u32 {
+    /// Agents active in the last 10 minutes, most recent first.
+    fn active_agents(&self) -> Vec<AgentSeen> {
         let since = now_ms().saturating_sub(10 * 60 * 1000);
-        self.inner
+        let mut list: Vec<AgentSeen> = self
+            .inner
             .agents
             .lock()
             .expect("agents lock")
-            .values()
-            .filter(|&&t| t >= since)
-            .count() as u32
+            .iter()
+            .filter(|&(_, &t)| t >= since)
+            .map(|(name, &last_seen)| AgentSeen {
+                name: name.clone(),
+                last_seen,
+            })
+            .collect();
+        list.sort_by_key(|a| std::cmp::Reverse(a.last_seen));
+        list
     }
 
     /// An agent's request (MCP `send_request`): refused requests are recorded too.
@@ -834,6 +915,229 @@ impl App {
         Ok(entry)
     }
 
+    // ---- Masking ------------------------------------------------------------------
+
+    /// The project's masking settings (operator only; agents never see real names here).
+    pub fn masking(&self) -> Masking {
+        let (masking, masker) = &*self.inner.masking.read().expect("masking lock");
+        Masking {
+            auto: masker.auto_sites(), // Strict: grows as agents meet other hosts
+            ..masking.clone()
+        }
+    }
+
+    /// What MCP uses to translate for agents.
+    pub fn masker(&self) -> Arc<Masker> {
+        self.inner.masking.read().expect("masking lock").1.clone()
+    }
+
+    pub fn set_masking(&self, masking: Masking) -> io::Result<Masking> {
+        self.use_masking(masking.normalized()?);
+        self.save_masking()?;
+        Ok(self.masking())
+    }
+
+    /// Strict gives other hosts aliases while it masks; MCP calls this afterwards so
+    /// they stay the same next time.
+    pub fn keep_mask_aliases(&self) {
+        if self.masker().take_new_aliases()
+            && let Err(e) = self.save_masking()
+        {
+            tracing::warn!("cannot save masking aliases: {e}");
+        }
+    }
+
+    /// Makes `masking` the active one; Strict gives the scope's hosts aliases at once.
+    fn use_masking(&self, masking: Masking) {
+        let masker = Arc::new(Masker::new(&masking));
+        for host in &self.scope().include {
+            masker.learn(host);
+        }
+        *self.inner.masking.write().expect("masking lock") = (masking, masker);
+    }
+
+    fn save_masking(&self) -> io::Result<()> {
+        let json = serde_json::to_string(&self.masking()).map_err(io::Error::other)?;
+        self.store()
+            .set_setting("masking", &json)
+            .map_err(io::Error::other)
+    }
+
+    // ---- AI browser ---------------------------------------------------------------
+
+    pub fn browser(&self) -> BrowserStatus {
+        let open = self.inner.browser.lock().expect("browser lock");
+        BrowserStatus {
+            running: open.is_some(),
+            binary: open.as_ref().map(|b| b.binary.clone()),
+            proxy_port: open.as_ref().map(|b| b.proxy_port),
+            cdp_port: open.as_ref().map(|b| b.cdp_port),
+            error: self
+                .inner
+                .browser_error
+                .lock()
+                .expect("browser lock")
+                .clone(),
+        }
+    }
+
+    /// Starts the AI browser (nothing happens if it is open): its own proxy listener
+    /// on a free loopback port, then the browser with the project's profile. When the
+    /// browser exits, its listener closes too.
+    pub async fn open_browser(&self) -> io::Result<BrowserStatus> {
+        if self.inner.browser.lock().expect("browser lock").is_some() {
+            return Ok(self.browser());
+        }
+        let result = self.start_browser().await;
+        *self.inner.browser_error.lock().expect("browser lock") =
+            result.as_ref().err().map(|e| e.to_string());
+        result.map(|()| self.browser())
+    }
+
+    async fn start_browser(&self) -> io::Result<()> {
+        let binary = browser::find(self.config().browser_path.as_deref()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no Chrome, Edge or Chromium found: install one, or set browser_path in config.toml",
+            )
+        })?;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let proxy_port = listener.local_addr()?.port();
+        let cdp_port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port(); // free right now; the browser takes it a moment later
+        let profile = Path::new(&self.project().path).join("browser");
+        let args = browser::args(proxy_port, cdp_port, &profile, self.inner.ca.spki_hashes());
+        let mut child = tokio::process::Command::new(&binary)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("cannot start {}: {e}", binary.display()))
+            })?;
+        let (stop, stop_rx) = watch::channel(false);
+        tokio::spawn(proxy::serve_browser(self.clone(), listener, stop_rx));
+        let (close, mut close_rx) = tokio::sync::mpsc::channel(1);
+        *self.inner.browser.lock().expect("browser lock") = Some(OpenBrowser {
+            binary: binary.display().to_string(),
+            proxy_port,
+            cdp_port,
+            close,
+        });
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = child.wait() => {}
+                _ = close_rx.recv() => drop(child.kill().await),
+            }
+            stop.send_replace(true);
+            let mut open = app.inner.browser.lock().expect("browser lock");
+            if open.as_ref().is_some_and(|b| b.proxy_port == proxy_port) {
+                *open = None;
+            }
+        });
+        Ok(())
+    }
+
+    /// An agent's browser tool call starts: what the browser requests now is the agent's.
+    pub fn begin_browser_action(&self, agent: &str) {
+        *self.inner.browser_driver.lock().expect("driver lock") =
+            Some((agent.to_string(), u64::MAX));
+    }
+
+    /// The call returned; requests it set off may still follow for a second.
+    pub fn end_browser_action(&self, agent: &str) {
+        let mut driver = self.inner.browser_driver.lock().expect("driver lock");
+        if let Some((name, until)) = driver.as_mut()
+            && name == agent
+        {
+            *until = now_ms() + 1000;
+        }
+    }
+
+    /// The agent the AI browser's requests belong to right now, if any (else the operator's).
+    pub(crate) fn browser_actor(&self) -> Option<String> {
+        let driver = self.inner.browser_driver.lock().expect("driver lock");
+        driver
+            .as_ref()
+            .filter(|(_, until)| now_ms() <= *until)
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Closes the AI browser, if it is open.
+    pub fn close_browser(&self) {
+        if let Some(open) = self.inner.browser.lock().expect("browser lock").as_ref() {
+            let _ = open.close.try_send(());
+        }
+    }
+
+    // ---- MCP log ------------------------------------------------------------------
+
+    /// Keeps an agent's MCP request and the reply it got. Stored up to [`MCP_LOG_MAX`]
+    /// characters each; the UI is told with a preview.
+    /// Assigns the call's `id` and `ts` (its start).
+    pub fn record_mcp_call(&self, mut call: McpCall) -> io::Result<()> {
+        call.id = new_id();
+        call.ts = now_ms().saturating_sub(call.duration_ms);
+        for text in [&mut call.request, &mut call.response] {
+            if text.len() > MCP_LOG_MAX {
+                let cut = (0..=MCP_LOG_MAX)
+                    .rev()
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(0);
+                let total = text.len();
+                text.truncate(cut);
+                text.push_str(&format!("\n[… shiftWire kept {cut} of {total} bytes]"));
+            }
+        }
+        // Sizes in characters, like the previews (and SQLite's length()).
+        call.request_size = call.request.chars().count() as u64;
+        call.response_size = call.response.chars().count() as u64;
+        self.store().add_mcp_call(&call).map_err(io::Error::other)?;
+        for text in [&mut call.request, &mut call.response] {
+            *text = text.chars().take(MCP_PREVIEW).collect();
+        }
+        self.inner.bus.emit(Event::McpCall { call });
+        Ok(())
+    }
+
+    /// The newest `limit` MCP calls older than `before`, oldest first, as previews.
+    pub fn mcp_calls(&self, limit: usize, before: Option<&str>) -> io::Result<Vec<McpCall>> {
+        self.store()
+            .mcp_calls(limit, before, Some(MCP_PREVIEW), None)
+            .map_err(io::Error::other)
+    }
+
+    /// Highlights MCP calls in the MCP log, like flows in History (`None` clears it).
+    pub fn color_mcp_calls(&self, ids: &[String], color: Option<&str>) -> io::Result<()> {
+        if let Some(c) = color.filter(|c| !COLORS.contains(c)) {
+            return Err(invalid(format!(
+                "unknown color {c:?} (use {})",
+                COLORS.join(", ")
+            )));
+        }
+        self.store()
+            .color_mcp_calls(ids, color)
+            .map_err(io::Error::other)?;
+        self.inner.bus.emit(Event::McpCallsColored {
+            ids: ids.to_vec(),
+            color: color.map(str::to_string),
+        });
+        Ok(())
+    }
+
+    /// One MCP call in full.
+    pub fn mcp_call(&self, id: &str) -> io::Result<Option<McpCall>> {
+        let mut found = self
+            .store()
+            .mcp_calls(1, None, None, Some(id))
+            .map_err(io::Error::other)?;
+        Ok(found.pop())
+    }
+
     /// Kill switch: while paused, every request from an AI agent is refused.
     pub fn agent_mode(&self) -> AgentMode {
         *self.inner.agent_mode.lock().expect("mode lock")
@@ -884,7 +1188,7 @@ impl App {
             id: crate::new_id(),
             name: format!("{agent}: {name}"),
             target: target.clone(),
-            raw: raw.to_string(),
+            raw: editor_text(raw),
             sends: Vec::new(),
         };
         self.save_tab(&tab)?;
@@ -900,6 +1204,7 @@ impl App {
 
     /// Flushes pending captures to disk. Call once on shutdown.
     pub fn close(&self) {
+        self.close_browser();
         self.store().close();
     }
 
@@ -909,6 +1214,11 @@ impl App {
     }
 
     pub(crate) fn record(&self, flow: Flow) {
+        if matches!(flow.source.as_str(), "proxy" | "tunnel") {
+            self.inner
+                .proxy_last_request
+                .fetch_max(flow.ts_start, Ordering::Relaxed);
+        }
         self.store().record(flow);
     }
 
@@ -918,6 +1228,22 @@ impl App {
 
     pub(crate) fn crypto(&self) -> Arc<rustls::crypto::CryptoProvider> {
         self.inner.crypto.clone()
+    }
+}
+
+/// Repeater text uses `\n` line endings (as the editor shows it); agents often send
+/// `\r\n`. The sender writes proper CRLF on the wire either way.
+fn editor_text(raw: &str) -> String {
+    raw.replace("\r\n", "\n")
+}
+
+/// See [`App::proxy_connection`].
+pub(crate) struct ConnectionGuard(App);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let open = &self.0.inner.proxy_connections;
+        open.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1138,5 +1464,81 @@ mod tests {
             })
         ));
         assert!(!app.status().ai_paused);
+    }
+
+    #[test]
+    fn agents_crlf_requests_become_editor_text() {
+        let app = test_app("crlf-tab");
+        let target = Target {
+            scheme: "https".into(),
+            host: "a.test".into(),
+            port: 443,
+        };
+        let raw = "POST /login HTTP/1.1\r\nHost: a.test\r\n\r\nname=x";
+        let tab = app
+            .prepare_request("claude", &target, raw, "login")
+            .unwrap();
+        assert_eq!(tab.raw, "POST /login HTTP/1.1\nHost: a.test\n\nname=x");
+        let tab = app
+            .repeater_update(&tab.id, None, None, Some(raw.into()))
+            .unwrap();
+        assert!(!tab.raw.contains('\r'), "edits too");
+    }
+
+    #[tokio::test]
+    async fn mcp_calls_are_kept_in_full_and_listed_as_previews() {
+        let app = test_app("mcp-log");
+        let mut rx = app.subscribe();
+        let call = |tool: &str, response: String| McpCall {
+            id: String::new(),
+            ts: 0,
+            agent: "claude".into(),
+            method: "tools/call".into(),
+            tool: Some(tool.into()),
+            request: r#"{"id": "f1"}"#.into(),
+            response,
+            is_error: false,
+            duration_ms: 3,
+            request_size: 0,
+            response_size: 0,
+            color: None,
+        };
+        app.record_mcp_call(call("get_scope", "Scope: a.test".into()))
+            .unwrap();
+        let huge = "é".repeat(MCP_LOG_MAX); // 2 bytes each: cut on a char boundary
+        app.record_mcp_call(call("get_flow", huge)).unwrap();
+
+        let Ok(Event::McpCall { call: first }) = rx.recv().await else {
+            panic!("an event per call")
+        };
+        assert_eq!(first.tool.as_deref(), Some("get_scope"));
+        let listed = app.mcp_calls(10, None).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].response, "Scope: a.test", "oldest first");
+        assert_eq!(listed[1].response.chars().count(), MCP_PREVIEW);
+        assert!(listed[1].response_size > MCP_PREVIEW as u64);
+
+        let full = app.mcp_call(&listed[1].id).unwrap().unwrap();
+        assert!(
+            full.response
+                .ends_with(&format!("of {} bytes]", 2 * MCP_LOG_MAX))
+        );
+        assert_eq!(full.response.chars().count() as u64, full.response_size);
+        assert!(
+            app.mcp_calls(10, Some(&listed[1].id)).unwrap().len() == 1,
+            "paging"
+        );
+        assert!(app.mcp_call("nope").unwrap().is_none());
+        app.color_mcp_calls(&[listed[0].id.clone()], Some("purple"))
+            .unwrap();
+        assert_eq!(
+            app.mcp_calls(10, None).unwrap()[0].color.as_deref(),
+            Some("purple"),
+            "a double-click in the MCP log sticks"
+        );
+        assert!(
+            app.color_mcp_calls(&[listed[0].id.clone()], Some("pink"))
+                .is_err()
+        );
     }
 }

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post, put};
+use axum::routing::{any, get, post, put};
 use axum::{Json, Router, middleware};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,6 +37,8 @@ pub struct Shared {
     pub data_dir: std::path::PathBuf,
     /// Set when the operator changed the listen addresses: start again after stopping.
     pub restart: std::sync::atomic::AtomicBool,
+    /// Agents' browser tools (Playwright MCP, attached to the AI browser).
+    pub playwright: crate::playwright::Playwright,
 }
 
 pub type Ctx = Arc<Shared>;
@@ -71,11 +73,48 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/api/timeline", get(timeline))
         .route("/api/timeline/message", post(message_agents))
         .route("/api/flows/mark", post(mark_flow))
-        .route("/mcp", get(mcp::get).post(mcp::post))
+        .route("/api/masking", get(get_masking).put(set_masking))
+        .route("/api/browser/open", post(open_browser))
+        .route("/api/browser/close", post(close_browser))
+        .route("/api/mcp-calls", get(mcp_calls))
+        .route("/api/mcp-calls/{id}", get(mcp_call))
+        .route("/api/mcp-calls/color", post(color_mcp_calls))
+        .route("/mcp", any(mcp_moved))
         .route("/ws", get(ws::upgrade))
         .fallback(ui::serve)
         .layer(middleware::from_fn_with_state(ctx.clone(), guard::guard))
         .with_state(ctx)
+}
+
+/// The MCP port serves only `/mcp`: the one way in for agents (besides the proxy).
+pub fn mcp_router(ctx: Ctx) -> Router {
+    Router::new()
+        .route("/mcp", get(mcp::get).post(mcp::post))
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                "This is the shiftWire MCP port: use /mcp",
+            )
+        })
+        .layer(middleware::from_fn_with_state(ctx.clone(), guard::guard))
+        .with_state(ctx)
+}
+
+/// Agents still configured with the old address learn the new one.
+async fn mcp_moved(State(c): State<Ctx>) -> (StatusCode, String) {
+    let url = local_url(c.app.config().mcp_addr);
+    (
+        StatusCode::NOT_FOUND,
+        format!("The shiftWire MCP has its own port now: {url}/mcp"),
+    )
+}
+
+/// `http://127.0.0.1:7777` for a listen address (all interfaces: loopback, for local clients).
+pub fn local_url(mut addr: std::net::SocketAddr) -> String {
+    if addr.ip().is_unspecified() {
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    format!("http://{addr}")
 }
 
 async fn health() -> Json<Value> {
@@ -316,6 +355,69 @@ async fn timeline(
     c.app.timeline(limit).map(Json).map_err(api_error)
 }
 
+/// What agents see of the target's names (operator only, never over MCP).
+async fn get_masking(State(c): State<Ctx>) -> Json<shiftwire_core::Masking> {
+    Json(c.app.masking())
+}
+
+async fn set_masking(
+    State(c): State<Ctx>,
+    Json(m): Json<shiftwire_core::Masking>,
+) -> ApiResult<Json<shiftwire_core::Masking>> {
+    c.app.set_masking(m).map(Json).map_err(api_error)
+}
+
+/// Opens the AI browser (operator only: agents have no tool for it).
+async fn open_browser(State(c): State<Ctx>) -> ApiResult<Json<shiftwire_core::BrowserStatus>> {
+    c.app.open_browser().await.map(Json).map_err(api_error)
+}
+
+async fn close_browser(State(c): State<Ctx>) -> StatusCode {
+    c.app.close_browser();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct McpCallsQuery {
+    limit: Option<usize>,
+    /// Page backwards: only calls older than this id.
+    before: Option<String>,
+}
+
+/// The MCP log: what agents sent over MCP and what they got back (previews, oldest first).
+async fn mcp_calls(
+    State(c): State<Ctx>,
+    Query(q): Query<McpCallsQuery>,
+) -> ApiResult<Json<Vec<shiftwire_core::McpCall>>> {
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    c.app
+        .mcp_calls(limit, q.before.as_deref())
+        .map(Json)
+        .map_err(api_error)
+}
+
+/// Highlights MCP calls (double-click in the MCP log), like `POST /api/flows/color`.
+async fn color_mcp_calls(
+    State(c): State<Ctx>,
+    Json(r): Json<ColorRequest>,
+) -> ApiResult<StatusCode> {
+    c.app
+        .color_mcp_calls(&r.ids, r.color.as_deref())
+        .map_err(api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// One MCP call with the full request and response.
+async fn mcp_call(
+    State(c): State<Ctx>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<shiftwire_core::McpCall>> {
+    match c.app.mcp_call(&id).map_err(api_error)? {
+        Some(call) => Ok(Json(call)),
+        None => Err((StatusCode::NOT_FOUND, format!("no MCP call {id}"))),
+    }
+}
+
 #[derive(Deserialize)]
 struct MessageRequest {
     text: String,
@@ -366,6 +468,7 @@ async fn get_network(State(c): State<Ctx>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "api_addr": config.api_addr,
         "proxy_addr": config.proxy_addr,
+        "mcp_addr": config.mcp_addr,
         "api_token": c.api_token,
         "proxy_password": if config.proxy_addr.ip().is_loopback() { None } else { secret("proxy.password") },
         // WSL2 sits behind NAT by default: "all interfaces" is not the PC's network.
@@ -378,6 +481,7 @@ async fn get_network(State(c): State<Ctx>) -> Json<serde_json::Value> {
 struct Network {
     api_addr: String,
     proxy_addr: String,
+    mcp_addr: String,
 }
 
 /// Checks the new addresses, saves them and restarts the daemon on them.
@@ -399,15 +503,23 @@ async fn set_network(
     };
     let api = parse(&n.api_addr, "UI")?;
     let proxy = parse(&n.proxy_addr, "Proxy")?;
-    let overlap =
-        api.ip() == proxy.ip() || api.ip().is_unspecified() || proxy.ip().is_unspecified();
-    if api.port() == proxy.port() && overlap {
-        return Err(bad("the UI and the proxy need different ports".into()));
+    let mcp = parse(&n.mcp_addr, "MCP")?;
+    let all = [(api, "UI"), (proxy, "proxy"), (mcp, "MCP")];
+    for (i, (a, a_name)) in all.iter().enumerate() {
+        for (b, b_name) in &all[i + 1..] {
+            let overlap = a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified();
+            if a.port() == b.port() && overlap {
+                return Err(bad(format!(
+                    "the {a_name} and the {b_name} need different ports"
+                )));
+            }
+        }
     }
     let current = c.app.config();
     for (new, old, what) in [
         (api, current.api_addr, "UI"),
         (proxy, current.proxy_addr, "proxy"),
+        (mcp, current.mcp_addr, "MCP"),
     ] {
         // A new port must be free now (the current one is ours, so it cannot be tested).
         if new.port() != old.port() {
@@ -417,15 +529,15 @@ async fn set_network(
     }
     let path = c.data_dir.join("config.toml");
     let mut config = Config::load_or_create(&path).map_err(api_error)?;
-    (config.api_addr, config.proxy_addr) = (api, proxy);
+    (config.api_addr, config.proxy_addr, config.mcp_addr) = (api, proxy, mcp);
     config.save(&path).map_err(api_error)?;
-    if api != current.api_addr || proxy != current.proxy_addr {
-        info!("listen addresses changed (UI {api}, proxy {proxy}): restarting");
+    if api != current.api_addr || proxy != current.proxy_addr || mcp != current.mcp_addr {
+        info!("listen addresses changed (UI {api}, proxy {proxy}, MCP {mcp}): restarting");
         c.restart.store(true, std::sync::atomic::Ordering::Relaxed);
         c.stop.send_replace(true);
     }
     Ok(Json(
-        serde_json::json!({ "api_addr": api, "proxy_addr": proxy }),
+        serde_json::json!({ "api_addr": api, "proxy_addr": proxy, "mcp_addr": mcp }),
     ))
 }
 
@@ -545,16 +657,13 @@ async fn serve(paths: &Paths, config: Config, detached: bool) -> Result<bool> {
     })?;
     let app = App::open(config.clone(), paths.root.clone()).context("cannot open the project")?;
     let token = daemon::new_token();
-    // Listening on all interfaces: local clients (CLI, MCP bridge, browser) use loopback.
-    let mut local = config.api_addr;
-    if local.ip().is_unspecified() {
-        local.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
-    }
-    let api_url = format!("http://{local}");
+    let api_url = local_url(config.api_addr);
+    let mcp_url = local_url(config.mcp_addr);
     DaemonState {
         pid: std::process::id(),
         version: VERSION.into(),
         api_url: api_url.clone(),
+        mcp_url: mcp_url.clone(),
         proxy_addr: config.proxy_addr.to_string(),
         started_at: app.status().started_at,
         token: token.clone(),
@@ -567,20 +676,22 @@ async fn serve(paths: &Paths, config: Config, detached: bool) -> Result<bool> {
         token,
         stop: stop.clone(),
         mcp_sessions: Default::default(),
-        api_token: if config.api_addr.ip().is_loopback() {
+        api_token: if config.api_addr.ip().is_loopback() && config.mcp_addr.ip().is_loopback() {
             None
         } else {
             Some(daemon::secret(paths, "api.token")?)
         },
         data_dir: paths.root.clone(),
         restart: Default::default(),
+        playwright: crate::playwright::Playwright::new(Some(paths.root.join("playwright"))),
     });
     if detached {
         ignore_hangup()?;
     }
     start_proxy(&ctx.app, paths, stop.subscribe()).await;
+    start_mcp(&ctx, stop.subscribe()).await;
     info!(
-        "shiftWire {VERSION} running: UI/API/MCP {api_url}, data {}",
+        "shiftWire {VERSION} running: UI/API {api_url}, MCP {mcp_url}/mcp, data {}",
         paths.root.display()
     );
 
@@ -625,6 +736,34 @@ async fn start_proxy(app: &App, paths: &Paths, stop: watch::Receiver<bool>) {
             app.set_proxy_error(Some(message));
         }
     }
+}
+
+/// Like the proxy, a busy MCP port is not fatal: the status bar and `shiftwire status` say why.
+async fn start_mcp(ctx: &Ctx, mut stop: watch::Receiver<bool>) {
+    let addr = ctx.app.config().mcp_addr;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            let message = format!("cannot listen on {addr}: {e}");
+            warn!("MCP disabled: {message}");
+            ctx.app.set_mcp_state(false, Some(message));
+            return;
+        }
+    };
+    info!("MCP listening on {addr}");
+    ctx.app.set_mcp_state(true, None);
+    let (app, router) = (ctx.app.clone(), mcp_router(ctx.clone()));
+    tokio::spawn(async move {
+        let stopped = async move {
+            let _ = stop.wait_for(|s| *s).await;
+        };
+        let error = axum::serve(listener, router)
+            .with_graceful_shutdown(stopped)
+            .await
+            .err()
+            .map(|e| e.to_string());
+        app.set_mcp_state(false, error);
+    });
 }
 
 /// Resolves on Ctrl+C, SIGTERM, or `POST /api/shutdown`, and tells everyone.
@@ -708,6 +847,7 @@ mod tests {
             api_token: None,
             data_dir: dir.clone(),
             restart: Default::default(),
+            playwright: crate::playwright::Playwright::new(None), // no Node in tests
         })
     }
 
@@ -778,18 +918,15 @@ mod tests {
             *r.method_mut() = axum::http::Method::PUT;
             r
         };
-        for (api, proxy) in [
-            ("127.0.0.1:9000", "127.0.0.1:9000"),
-            ("nonsense", "127.0.0.1:8080"),
-            ("127.0.0.1:0", "127.0.0.1:8080"),
+        for (api, proxy, mcp) in [
+            ("127.0.0.1:9000", "127.0.0.1:9000", "127.0.0.1:7778"),
+            ("127.0.0.1:7777", "127.0.0.1:8080", "0.0.0.0:7777"),
+            ("nonsense", "127.0.0.1:8080", "127.0.0.1:7778"),
+            ("127.0.0.1:0", "127.0.0.1:8080", "127.0.0.1:7778"),
         ] {
-            let res = router(ctx.clone())
-                .oneshot(put(
-                    serde_json::json!({ "api_addr": api, "proxy_addr": proxy }),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{api} {proxy}");
+            let body = serde_json::json!({ "api_addr": api, "proxy_addr": proxy, "mcp_addr": mcp });
+            let res = router(ctx.clone()).oneshot(put(body)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{api} {proxy} {mcp}");
         }
         assert!(!*ctx.stop.borrow(), "bad input changes nothing");
 
@@ -797,8 +934,11 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let body =
-            serde_json::json!({ "api_addr": "127.0.0.1:7777", "proxy_addr": free.to_string() });
+        let body = serde_json::json!({
+            "api_addr": "127.0.0.1:7777",
+            "proxy_addr": free.to_string(),
+            "mcp_addr": "127.0.0.1:7778",
+        });
         let res = router(ctx.clone()).oneshot(put(body)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let saved = Config::load_or_create(&ctx.data_dir.join("config.toml")).unwrap();
@@ -917,7 +1057,7 @@ mod tests {
         if let Some(s) = session {
             r.headers_mut().insert("mcp-session-id", s.parse().unwrap());
         }
-        let res = router(ctx.clone()).oneshot(r).await.unwrap();
+        let res = mcp_router(ctx.clone()).oneshot(r).await.unwrap();
         let session = res
             .headers()
             .get("mcp-session-id")
@@ -1099,6 +1239,42 @@ mod tests {
         )
         .await;
         assert_eq!(notification, Value::Null, "notifications get no body");
+
+        // The MCP log has every request with exactly what the agent got back.
+        let log = ctx.app.mcp_calls(100, None).unwrap();
+        let first = &log[0];
+        assert_eq!(
+            (first.method.as_str(), first.agent.as_str()),
+            ("initialize", "claude-code")
+        );
+        assert!(
+            log.iter()
+                .any(|c| c.method == "tools/list" && c.response.contains("send_request"))
+        );
+        let refused = log
+            .iter()
+            .find(|c| c.tool.as_deref() == Some("send_request"))
+            .unwrap();
+        assert!(
+            refused.request.contains("127.0.0.1:9"),
+            "{}",
+            refused.request
+        );
+        assert!(
+            refused.response.contains("out of scope"),
+            "{}",
+            refused.response
+        );
+        let full = router(ctx.clone())
+            .oneshot(req(
+                "GET",
+                &format!("/api/mcp-calls/{}", refused.id),
+                "127.0.0.1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert!(!log.iter().any(|c| c.method.starts_with("notifications")));
     }
 
     #[tokio::test]
@@ -1155,6 +1331,207 @@ mod tests {
         assert_eq!(
             router(ctx.clone()).oneshot(r).await.unwrap().status(),
             StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_tools_check_mode_scope_and_the_open_browser_first() {
+        let ctx = test_ctx();
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"x"}}});
+        let session = mcp_call(&ctx, None, init).await.0.unwrap();
+        let call = |name: &str, args: Value| json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":args}});
+        let reply = |v: Value| {
+            let r = &v["result"];
+            (
+                r["content"][0]["text"].as_str().unwrap().to_string(),
+                r["isError"] == true,
+            )
+        };
+        let (text, err) = reply(
+            mcp_call(
+                &ctx,
+                Some(&session),
+                call("browser_run_code_unsafe", json!({})),
+            )
+            .await
+            .1,
+        );
+        assert!(err && text.contains("unknown tool"), "{text}");
+        let (text, err) = reply(
+            mcp_call(
+                &ctx,
+                Some(&session),
+                call("browser_navigate", json!({"url":"https://elsewhere.test/"})),
+            )
+            .await
+            .1,
+        );
+        assert!(err && text.contains("out of scope"), "{text}");
+        let (text, err) = reply(
+            mcp_call(&ctx, Some(&session), call("browser_snapshot", json!({})))
+                .await
+                .1,
+        );
+        assert!(err && text.contains("not open"), "{text}");
+        ctx.app.set_agent_mode(AgentMode::Advise).unwrap();
+        let (text, err) = reply(
+            mcp_call(
+                &ctx,
+                Some(&session),
+                call("browser_click", json!({"element":"x","target":"e1"})),
+            )
+            .await
+            .1,
+        );
+        assert!(err && text.contains("advise mode"), "{text}");
+        let (text, _) = reply(
+            mcp_call(&ctx, Some(&session), call("browser_snapshot", json!({})))
+                .await
+                .1,
+        );
+        assert!(
+            text.contains("not open"),
+            "looking is allowed in advise mode: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn masking_translates_what_agents_send_and_masks_what_they_get() {
+        use shiftwire_core::{MaskLevel, MaskSite, Masking};
+        let ctx = test_ctx();
+        ctx.app
+            .set_scope(Scope {
+                include: vec!["shop.example.test".into()],
+                exclude: vec![],
+            })
+            .unwrap();
+        let masking = Masking {
+            level: MaskLevel::Content,
+            sites: vec![MaskSite {
+                real: "example.test".into(),
+                alias: String::new(),
+            }],
+            ..Masking::default()
+        };
+        let body = serde_json::to_string(&masking).unwrap();
+        let mut r = req("PUT", "/api/masking", "127.0.0.1");
+        *r.body_mut() = Body::from(body);
+        r.headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        assert_eq!(
+            router(ctx.clone()).oneshot(r).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"x"}}});
+        let session = mcp_call(&ctx, None, init).await.0.unwrap();
+        let call = |name: &str, args: Value| json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":args}});
+        let text = |v: &Value| {
+            v["result"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["text"].as_str().unwrap_or_default().to_string())
+                .collect::<String>()
+        };
+
+        let scope = text(
+            &mcp_call(&ctx, Some(&session), call("get_scope", json!({})))
+                .await
+                .1,
+        );
+        assert!(
+            scope.contains("shop.target1.masked") && !scope.contains("example.test"),
+            "{scope}"
+        );
+        let info = text(
+            &mcp_call(&ctx, Some(&session), call("proxy_info", json!({})))
+                .await
+                .1,
+        );
+        assert!(
+            info.contains("masking on") && !info.contains("HTTPS_PROXY"),
+            "{info}"
+        );
+
+        // The agent uses the alias; shiftWire sends to the real host (unreachable here).
+        let sent = text(
+            &mcp_call(
+                &ctx,
+                Some(&session),
+                call(
+                    "send_request",
+                    json!({"url":"http://shop.target1.masked:9/x"}),
+                ),
+            )
+            .await
+            .1,
+        );
+        assert!(
+            sent.contains("shop.target1.masked") && !sent.contains("example.test"),
+            "{sent}"
+        );
+        let mut flows = Vec::new();
+        for _ in 0..100 {
+            flows = ctx.app.recent_flows(10).unwrap(); // captures are written in the background
+            if !flows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            flows.last().unwrap().host,
+            "shop.example.test",
+            "History keeps the real host"
+        );
+        ctx.app
+            .message_agents("check shop.example.test/admin")
+            .unwrap();
+        let note = text(
+            &mcp_call(&ctx, Some(&session), call("get_scope", json!({})))
+                .await
+                .1,
+        );
+        assert!(
+            note.contains("check shop.target1.masked/admin"),
+            "operator messages too: {note}"
+        );
+
+        let shot = mcp_call(
+            &ctx,
+            Some(&session),
+            call("browser_take_screenshot", json!({})),
+        )
+        .await
+        .1;
+        assert!(text(&shot).contains("off while masking is on"), "{shot}");
+        let log = ctx.app.mcp_calls(100, None).unwrap();
+        assert!(
+            log.iter().all(|c| !c.response.contains("example.test")),
+            "the MCP log shows what the agent saw"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_api_port_points_agents_to_the_mcp_port() {
+        let res = router(test_ctx())
+            .oneshot(req("POST", "/mcp", "127.0.0.1"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("http://127.0.0.1:7778/mcp"), "{text}");
+        let res = mcp_router(test_ctx())
+            .oneshot(req("GET", "/api/status", "127.0.0.1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "the MCP port serves only /mcp"
         );
     }
 

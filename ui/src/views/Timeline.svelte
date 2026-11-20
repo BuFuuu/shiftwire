@@ -5,6 +5,7 @@
   import SplitPane from '../components/SplitPane.svelte';
   import Detail from './Detail.svelte';
   import { timeline } from '../lib/live.svelte';
+  import { colorFlows } from '../lib/api';
   import { nav } from '../lib/nav.svelte';
   import { repeater } from '../lib/repeater.svelte';
   import { bytes, statusClass, time } from '../lib/format';
@@ -211,6 +212,7 @@
     class:colored={f.color}
     style:--c={f.color ? `var(--c-${f.color})` : null}
     onclick={() => (selected = f.id)}
+    ondblclick={() => void colorFlows([f.id], f.color === 'purple' ? null : 'purple')}
     oncontextmenu={(e) => (e.preventDefault(), (selected = f.id), (menu = { x: e.clientX, y: e.clientY, flow: f }))}
     title={f.error ?? ''}
   >
@@ -524,6 +526,9 @@
   }
   .flow:hover {
     background: var(--hover);
+  }
+  .flow.colored {
+    background: color-mix(in srgb, var(--c) 14%, transparent);
   }
   .flow.on {
     background: var(--selected);

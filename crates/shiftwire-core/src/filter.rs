@@ -22,7 +22,7 @@ use std::fmt;
 use crate::model::FlowSummary;
 
 pub const FIELDS: &str =
-    "host, path, method, status, actor, tag, color, mime, note, size, ms, id, intent, is";
+    "host, path, method, status, actor, via, tag, color, mime, note, size, ms, id, intent, is";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filter(Option<Node>);
@@ -64,6 +64,8 @@ enum TextField {
     Note,
     /// The agent's log_intent id a request was sent under.
     Intent,
+    /// Which way it came in: proxy, tunnel, repeater, mcp, invisible.
+    Via,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -103,6 +105,10 @@ fn row_text(f: &FlowSummary) -> String {
         f.actor, f.method, f.host, f.port, f.path
     )
 }
+
+/// [`crate::model::via`] in SQL.
+const VIA_SQL: &str =
+    "CASE WHEN source LIKE 'invisible:%' OR source = 'redirect' THEN 'invisible' ELSE source END";
 
 const ROW_TEXT_SQL: &str = "actor || ' ' || method || ' ' || host || ':' || port || ' ' || path     || COALESCE('?' || query, '') || ' ' || COALESCE(status, '')";
 
@@ -221,6 +227,7 @@ impl Node {
                     TextField::Mime => f.mime.as_deref().unwrap_or(""),
                     TextField::Note => f.note.as_deref().unwrap_or(""),
                     TextField::Intent => f.intent.as_deref().unwrap_or(""),
+                    TextField::Via => &f.via,
                 };
                 glob.matches(text)
                     || (*field == TextField::Any && f.tags.iter().any(|t| glob.matches(t)))
@@ -265,6 +272,7 @@ impl Node {
                     TextField::Mime => "COALESCE(mime, '')",
                     TextField::Note => "COALESCE(note, '')",
                     TextField::Intent => "COALESCE(intent, '')",
+                    TextField::Via => VIA_SQL,
                 };
                 params.push(glob.like());
                 let n = params.len();
@@ -444,6 +452,7 @@ fn term(word: &str) -> Result<Node, FilterError> {
         "mime" | "type" => text(TextField::Mime, false),
         "note" => text(TextField::Note, false),
         "intent" => text(TextField::Intent, true),
+        "via" => text(TextField::Via, true),
         "tag" => Ok(Node::Tag(Glob::from_value(value, true))),
         "status" => number(NumField::Status, value),
         "size" => number(NumField::Size, value),
@@ -551,6 +560,7 @@ mod tests {
             mark: None,
             mark_reason: None,
             intent: Some("01INTENT".into()),
+            via: "proxy".into(),
         }
     }
 
@@ -623,6 +633,9 @@ mod tests {
         );
         assert!(m("is:tagged is:noted is:ai is:error", &f));
         assert!(m("status:0", &f), "no status counts as 0");
+        assert!(m("via:proxy", &f));
+        f.via = "invisible".into(); // old rows from the removed invisible proxy
+        assert!(m("via:invisible", &f) && !m("via:invis", &f));
     }
 
     /// What the UI sends for lasting filters: main filter, "show only" chips ORed, "hide" chips excluded.

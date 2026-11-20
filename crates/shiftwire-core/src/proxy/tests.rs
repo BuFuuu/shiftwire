@@ -710,6 +710,7 @@ async fn rules_replace_and_alert_before_forwarding() {
         pattern: pattern.into(),
         replace: replace.into(),
         when_missing,
+        block: false,
     };
     app.set_rules(vec![
         rule(
@@ -796,6 +797,176 @@ async fn rules_replace_and_alert_before_forwarding() {
         "History shows what was sent"
     );
     assert_eq!(stored.tags.len(), 3, "rule tags are stored");
+}
+
+#[tokio::test]
+async fn blocking_alert_rules_stop_proxied_and_agent_requests() {
+    use crate::{Rule, RuleMode, RulePart, Scope, Target};
+    let app = app_with("block", Config::default());
+    app.set_rules(vec![Rule {
+        id: String::new(),
+        name: "no passwords".into(),
+        enabled: true,
+        mode: RuleMode::Alert,
+        part: RulePart::Body,
+        pattern: "password=".into(),
+        replace: String::new(),
+        when_missing: false,
+        block: true,
+    }])
+    .unwrap();
+    let mut events = app.subscribe();
+    let (proxy, _stop) = start_proxy(&app).await;
+    let up = echo_http().await;
+
+    let resp = send_raw(
+        proxy,
+        &format!(
+            "POST http://{up}/login HTTP/1.1\r\nHost: {up}\r\nContent-Length: 10\r\nConnection: close\r\n\r\npassword=x"
+        ),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    assert!(
+        resp.contains("blocked by the alert rule \"no passwords\""),
+        "{resp}"
+    );
+    let (mut alerted, mut flow) = (false, None);
+    while flow.is_none() {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::RuleAlert { blocked, .. } => alerted = blocked,
+            Event::FlowAdded { flow: f } => flow = Some(*f),
+            _ => {}
+        }
+    }
+    let flow = flow.unwrap();
+    assert!(alerted, "the alert says it blocked");
+    assert!(flow.error.as_deref().unwrap().contains("blocked"));
+    assert_eq!(flow.status, None, "never reached the target");
+
+    // An agent's own send_request obeys the same rule.
+    app.set_scope(Scope {
+        include: vec!["127.0.0.1".into()],
+        exclude: vec![],
+    })
+    .unwrap();
+    let target = Target {
+        scheme: "http".into(),
+        host: up.ip().to_string(),
+        port: up.port(),
+    };
+    let sent = app
+        .agent_send("claude", &target, "POST /login HTTP/1.1\n\npassword=y")
+        .await
+        .unwrap();
+    assert!(
+        sent.summary
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("no passwords")
+    );
+    assert!(sent.response.is_none(), "not sent");
+    assert_eq!(sent.summary.tags, ["alert:no-passwords"]);
+}
+
+#[tokio::test]
+async fn the_browser_listener_marks_its_requests_and_is_not_counted_as_proxy_clients() {
+    let app = app_with("browser-listener", Config::default());
+    let mut events = app.subscribe();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_stop, rx) = watch::channel(false);
+    tokio::spawn(super::serve_browser(app.clone(), listener, rx));
+    let up = echo_http().await;
+    let resp = send_raw(
+        addr,
+        &format!("GET http://{up}/page HTTP/1.1\r\nHost: {up}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    let flow = next_flow(&mut events).await;
+    assert_eq!(flow.via, "browser");
+    assert_eq!(app.status().proxy_connections, 0);
+    assert_eq!(app.status().proxy_last_request, 0, "not the proxy port");
+    assert_eq!(flow.actor, "proxy", "nobody drives it: the operator's");
+
+    // During an agent's browser action (and a moment after), requests are the agent's.
+    app.begin_browser_action("claude");
+    let get = format!("GET http://{up}/x HTTP/1.1\r\nHost: {up}\r\nConnection: close\r\n\r\n");
+    send_raw(addr, &get).await;
+    assert_eq!(next_flow(&mut events).await.actor, "claude");
+    app.end_browser_action("claude");
+    send_raw(addr, &get).await;
+    assert_eq!(
+        next_flow(&mut events).await.actor,
+        "claude",
+        "just after the call"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    send_raw(addr, &get).await;
+    assert_eq!(next_flow(&mut events).await.actor, "proxy");
+}
+
+#[tokio::test]
+async fn the_ai_browser_gets_a_welcome_page_instead_of_ca_instructions() {
+    let app = app_with("browser-welcome", Config::default());
+    let (proxy, _stop) = start_proxy(&app).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let browser = listener.local_addr().unwrap();
+    let (_stop2, rx) = watch::channel(false);
+    tokio::spawn(super::serve_browser(app.clone(), listener, rx));
+    let get = "GET http://shiftwire/ HTTP/1.1\r\nHost: shiftwire\r\nConnection: close\r\n\r\n";
+    let welcome = send_raw(browser, get).await;
+    assert!(
+        welcome.contains("shiftWire AI browser") && !welcome.contains("Download the shiftWire CA")
+    );
+    let ca_page = send_raw(proxy, get).await;
+    assert!(
+        ca_page.contains("Download the shiftWire CA"),
+        "other clients still get the CA page"
+    );
+}
+
+#[tokio::test]
+async fn masking_keeps_agents_off_the_proxy() {
+    use crate::{MaskLevel, MaskSite, Masking};
+    let app = app_with("masking-proxy", Config::default());
+    app.set_scope(Scope {
+        include: vec!["127.0.0.1".into()],
+        exclude: vec![],
+    })
+    .unwrap();
+    let (proxy, _stop) = start_proxy(&app).await;
+    let up = echo_http().await;
+    let creds = base64::engine::general_purpose::STANDARD.encode("claude:x");
+    let request = |auth: &str| {
+        format!("GET http://{up}/ HTTP/1.1\r\nHost: {up}\r\n{auth}Connection: close\r\n\r\n")
+    };
+    let agent = format!("Proxy-Authorization: Basic {creds}\r\n");
+    app.set_masking(Masking {
+        level: MaskLevel::Addresses,
+        sites: vec![MaskSite {
+            real: "example.test".into(),
+            alias: String::new(),
+        }],
+        ..Masking::default()
+    })
+    .unwrap();
+    let refused = send_raw(proxy, &request(&agent)).await;
+    assert!(
+        refused.starts_with("HTTP/1.1 403") && refused.contains("masking is on"),
+        "{refused}"
+    );
+    let human = send_raw(proxy, &request("")).await;
+    assert!(
+        human.starts_with("HTTP/1.1 200"),
+        "the operator's own traffic is fine: {human}"
+    );
 }
 
 #[tokio::test]

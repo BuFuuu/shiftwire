@@ -58,6 +58,9 @@ pub struct DaemonState {
     pub pid: u32,
     pub version: String,
     pub api_url: String,
+    /// Where agents connect (`{mcp_url}/mcp`).
+    #[serde(default)]
+    pub mcp_url: String,
     pub proxy_addr: String,
     pub started_at: u64,
     /// Authorizes `POST /api/shutdown`. Only readable by the local user.
@@ -223,6 +226,7 @@ mod tests {
             pid: 42,
             version: "0.1.0".into(),
             api_url: "http://127.0.0.1:7777".into(),
+            mcp_url: "http://127.0.0.1:7778".into(),
             proxy_addr: "127.0.0.1:8080".into(),
             started_at: 1,
             token: new_token(),

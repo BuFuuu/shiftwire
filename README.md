@@ -35,7 +35,7 @@ shiftwire status   # is it running? URLs and counters
 shiftwire stop
 ```
 
-UI on `http://127.0.0.1:7777`, proxy on `127.0.0.1:8080`.
+UI on `http://127.0.0.1:7777`, proxy on `127.0.0.1:8080`, MCP on `http://127.0.0.1:7778/mcp`.
 For HTTPS, trust the shiftWire CA: open `http://shiftwire/` through the proxy.
 
 Build, setup and agent config: **[QUICKSTART.md](QUICKSTART.md)**.

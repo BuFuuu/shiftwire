@@ -53,31 +53,33 @@ struct Proxy {
     app: App,
     client: Client<HttpsConnector<HttpConnector>, Tee<ReqBody>>,
     /// Ports of our own listeners, to refuse requests that would loop back to us.
-    own_ports: [u16; 2],
+    own_ports: [u16; 3],
+    /// Stored on its flows: `proxy`, or `browser` for the AI browser's listener.
+    source: &'static str,
 }
 
 /// Where requests on an intercepted TLS stream are going, and who opened it.
 struct Target {
+    scheme: &'static str,
     host: String,
     port: u16,
     actor: String,
 }
 
-pub(crate) async fn serve(app: App, listener: TcpListener, mut stop: watch::Receiver<bool>) {
-    let config = app.config();
-    let tls = tls::upstream_config(config.verify_upstream_tls, app.crypto());
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http()
-        .enable_http1()
-        .build();
+pub(crate) async fn serve(app: App, listener: TcpListener, stop: watch::Receiver<bool>) {
+    accept_loop(Proxy::new(app), listener, stop).await;
+}
+
+/// The AI browser's own listener: the same proxy, its requests marked `browser`.
+pub(crate) async fn serve_browser(app: App, listener: TcpListener, stop: watch::Receiver<bool>) {
     let proxy = Proxy {
-        own_ports: [config.proxy_addr.port(), config.api_addr.port()],
-        client: Client::builder(TokioExecutor::new())
-            .http1_preserve_header_case(true)
-            .build(connector),
-        app: app.clone(),
+        source: "browser",
+        ..Proxy::new(app)
     };
+    accept_loop(proxy, listener, stop).await;
+}
+
+async fn accept_loop(proxy: Proxy, listener: TcpListener, mut stop: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -97,9 +99,34 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 }
 
 impl Proxy {
+    fn new(app: App) -> Self {
+        let config = app.config();
+        let tls = tls::upstream_config(config.verify_upstream_tls, app.crypto());
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .build();
+        Self {
+            own_ports: [
+                config.proxy_addr.port(),
+                config.api_addr.port(),
+                config.mcp_addr.port(),
+            ],
+            source: "proxy",
+            client: Client::builder(TokioExecutor::new())
+                .http1_preserve_header_case(true)
+                .build(connector),
+            app,
+        }
+    }
+
     fn spawn_connection(&self, stream: TcpStream, peer: SocketAddr) {
         let proxy = self.clone();
+        // The status bar counts the proxy port's clients, not the AI browser's.
+        let open = (self.source == "proxy").then(|| self.app.proxy_connection());
         tokio::spawn(async move {
+            let _open = open; // counted in status while the client stays connected
             // Clients on this machine need no password; others do once one is set.
             let remote = !peer.ip().is_loopback();
             if let Err(e) = proxy.serve_http(stream, None, remote).await {
@@ -192,20 +219,24 @@ impl Proxy {
             if actor == "proxy" {
                 actor.clone_from(&t.actor);
             }
-            match https_uri(t, req.uri()) {
+            match absolute_uri(t, req.uri()) {
                 Some(uri) => *req.uri_mut() = uri,
                 None => return text(StatusCode::BAD_REQUEST, "Invalid request target."),
             }
         } else if req.method() == Method::CONNECT {
             return self.connect(req, actor);
         }
+        // The AI browser: the agent whose browser action is running, else the operator.
+        if self.source == "browser" {
+            actor = self.app.browser_actor().unwrap_or_else(|| "proxy".into());
+        }
 
         let uri = req.uri().clone();
         let Some(authority) = uri.authority() else {
-            return shiftwire_page(&self.app, "/"); // origin-form: someone opened the proxy port directly
+            return shiftwire_page(&self.app, "/", false); // origin-form: someone opened the proxy port directly
         };
         if authority.host().eq_ignore_ascii_case("shiftwire") {
-            return shiftwire_page(&self.app, uri.path());
+            return shiftwire_page(&self.app, uri.path(), self.source == "browser");
         }
         let scheme = match uri.scheme_str() {
             Some(s @ ("http" | "https")) => s.to_string(),
@@ -237,7 +268,7 @@ impl Proxy {
             seq: self.app.next_seq(),
             ts_start: now_ms(),
             actor,
-            source: "proxy".into(),
+            source: self.source.into(),
             scheme,
             host,
             port,
@@ -249,18 +280,34 @@ impl Proxy {
                 &format!("{} {} {:?}", req.method(), uri, req.version()),
                 req.headers(),
             ),
-            tags: outcome.tags,
+            tags: std::mem::take(&mut outcome.tags),
             ..Flow::default()
         };
         for rule in &outcome.alerts {
-            self.app.rule_alert(rule, &flow);
+            let blocked = outcome.blocked.as_ref() == Some(rule);
+            self.app.rule_alert(rule, &flow, blocked);
         }
 
         if flow.actor != "proxy" {
             self.app.touch_agent(&flow.actor);
             flow.intent = self.app.current_intent(&flow.actor); // filter: intent:<id>
         }
-        if let Err(reason) = self.app.agent_allowed(&flow.actor, &flow.host) {
+        // Not for the AI browser: a page's CDN and SSO requests would break. Agents'
+        // browser tools are checked instead (mode, and the scope of browser_navigate).
+        let mut refused = (self.source != "browser")
+            .then(|| self.app.agent_allowed(&flow.actor, &flow.host).err())
+            .flatten();
+        // Masking: an agent's own tools would see real names, so they cannot use the proxy.
+        if refused.is_none()
+            && self.source == "proxy"
+            && flow.actor != "proxy"
+            && self.app.masker().active()
+        {
+            refused = Some(
+                "masking is on: agents use shiftWire's MCP (send_request, repeat_flow, browser_*), not the proxy".into(),
+            );
+        }
+        if let Some(reason) = refused.or_else(|| outcome.block_reason()) {
             flow.error = Some(reason.clone());
             flow.ts_end = now_ms();
             self.app.record(flow);
@@ -347,7 +394,13 @@ impl Proxy {
             id: crate::new_id(),
             ts_start: now_ms(),
             actor,
-            source: "tunnel".into(),
+            // The AI browser's tunnels stay `browser`, so History and the status bar keep them apart.
+            source: if self.source == "browser" {
+                "browser"
+            } else {
+                "tunnel"
+            }
+            .into(),
             scheme: "https".into(),
             host,
             port,
@@ -403,6 +456,7 @@ impl Proxy {
         match handshake.await {
             Ok(stream) => {
                 let target = Arc::new(Target {
+                    scheme: "https",
                     host: flow.host,
                     port: flow.port,
                     actor: flow.actor,
@@ -456,19 +510,22 @@ impl Proxy {
 }
 
 /// `/path?q` on an intercepted stream → `https://host[:port]/path?q`.
-fn https_uri(target: &Target, uri: &Uri) -> Option<Uri> {
+fn absolute_uri(target: &Target, uri: &Uri) -> Option<Uri> {
     let path = uri.path_and_query().map_or("/", |p| p.as_str());
     let host = if target.host.contains(':') {
         format!("[{}]", target.host)
     } else {
         target.host.clone()
     };
-    let authority = if target.port == 443 {
+    let default = if target.scheme == "https" { 443 } else { 80 };
+    let authority = if target.port == default {
         host
     } else {
         format!("{host}:{}", target.port)
     };
-    format!("https://{authority}{path}").parse().ok()
+    format!("{}://{authority}{path}", target.scheme)
+        .parse()
+        .ok()
 }
 
 /// `Proxy-Authorization: Basic base64(agent:password)`: the user names the actor,
@@ -580,8 +637,14 @@ fn text(status: StatusCode, message: &str) -> Response<ProxyBody> {
 }
 
 /// `http://shiftwire/` (through the proxy): CA download and setup instructions.
-fn shiftwire_page(app: &App, path: &str) -> Response<ProxyBody> {
+/// `http://shiftwire/`: how to trust the CA, or (in the AI browser, which trusts it
+/// already) a short welcome page.
+fn shiftwire_page(app: &App, path: &str, ai_browser: bool) -> Response<ProxyBody> {
     let ca = app.ca();
+    if ai_browser && path == "/" {
+        let html = include_str!("browser_page.html");
+        return respond(StatusCode::OK, "text/html; charset=utf-8", html.to_string());
+    }
     if path == "/ca.crt" {
         let mut resp = respond(
             StatusCode::OK,

@@ -17,15 +17,87 @@ pub struct Status {
     pub proxy_running: bool,
     /// Why the proxy is not running (e.g. port in use), if it isn't.
     pub proxy_error: Option<String>,
+    /// Client connections open on the proxy port right now.
+    pub proxy_connections: u64,
+    /// Unix ms of the latest request that came in on the proxy port, 0 if none yet.
+    pub proxy_last_request: u64,
+    /// The MCP listener for agents, like the proxy fields above.
+    pub mcp_addr: String,
+    pub mcp_running: bool,
+    pub mcp_error: Option<String>,
     /// SHA-256 of the shiftWire CA certificate, to compare with what clients trust.
     pub ca_fingerprint: String,
     pub flows: u64,
     /// Captures skipped because the store could not keep up (forwarding still worked).
     pub dropped: u64,
     pub agents: u32,
+    /// The agents counted in `agents`, most recently active first.
+    pub agent_list: Vec<AgentSeen>,
     /// True when `agent_mode` is `off`.
     pub ai_paused: bool,
     pub agent_mode: AgentMode,
+    /// The AI browser shiftWire opens for the operator and agents.
+    pub browser: BrowserStatus,
+    /// What agents see of the target's names (Settings → Masking).
+    pub masking: crate::masking::Masking,
+}
+
+/// One MCP request from an agent and what it got back (the MCP log in the AI Timeline).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpCall {
+    /// ULID: time order.
+    pub id: String,
+    pub ts: u64,
+    pub agent: String,
+    /// The JSON-RPC method: `tools/call`, `initialize`, `tools/list`, ...
+    pub method: String,
+    /// The tool, for `tools/call`.
+    pub tool: Option<String>,
+    /// What the agent sent: the tool's arguments (or the method's params), as JSON.
+    pub request: String,
+    /// Exactly what the agent got back: the tool's text, or the JSON result or error.
+    pub response: String,
+    pub is_error: bool,
+    pub duration_ms: u64,
+    /// Full lengths; in lists `request` and `response` are only the start.
+    pub request_size: u64,
+    pub response_size: u64,
+    /// The operator's highlight (one of [`COLORS`]), like a flow's.
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// The AI browser: open or not, and why it could not open.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BrowserStatus {
+    pub running: bool,
+    /// The browser program, e.g. `/usr/bin/chromium`.
+    pub binary: Option<String>,
+    /// The proxy listener only this browser uses (loopback).
+    pub proxy_port: Option<u16>,
+    /// Its DevTools port (loopback), where Playwright attaches for agents.
+    pub cdp_port: Option<u16>,
+    pub error: Option<String>,
+}
+
+/// An agent that used MCP or the proxy recently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSeen {
+    pub name: String,
+    /// Unix ms of its latest action.
+    pub last_seen: u64,
+}
+
+/// Which way a request came in, from its stored `source`: `proxy` (the proxy port),
+/// `browser` (the AI browser), `tunnel`, `repeater`, `mcp` (an agent's send_request /
+/// repeat_flow) or `invisible` (requests from the invisible proxy of earlier versions,
+/// which stored `invisible:<address>` or `redirect`).
+pub fn via(source: &str) -> &str {
+    if source.starts_with("invisible:") || source == "redirect" {
+        "invisible"
+    } else {
+        source
+    }
 }
 
 /// What AI agents may do. The operator chooses; agents cannot change it.
@@ -62,7 +134,7 @@ pub struct Flow {
     pub ts_end: u64,
     /// Who sent it: an agent name from proxy credentials, "proxy" otherwise.
     pub actor: String,
-    /// "proxy" | "tunnel" (later: "repeater", "mcp").
+    /// "proxy", "browser", "tunnel", "repeater", "mcp" (see [`via`]).
     pub source: String,
     pub scheme: String,
     pub host: String,
@@ -123,6 +195,7 @@ impl Flow {
             mark: self.mark.clone(),
             mark_reason: self.mark_reason.clone(),
             intent: self.intent.clone(),
+            via: via(&self.source).to_string(),
         }
     }
 }
@@ -155,6 +228,8 @@ pub struct FlowSummary {
     pub mark_reason: Option<String>,
     /// The agent's intent (log_intent id) it was sent under: filter `intent:<id>`.
     pub intent: Option<String>,
+    /// Which way it came in (see [`via`]): filter `via:mcp`.
+    pub via: String,
 }
 
 /// A Repeater tab: a request being edited and the flows sent from it.

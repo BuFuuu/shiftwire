@@ -23,7 +23,7 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde.workspace = true
 time = "0.3"
-tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time", "macros", "process"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml = "0.9"
 serde_json.workspace = true

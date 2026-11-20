@@ -7,7 +7,7 @@
 import { invalidate } from './detail';
 import { loadTabs, repeater } from './repeater.svelte';
 import { nav } from './nav.svelte';
-import type { AgentMode, FlowSummary, WireEvent, Status, TimelineEntry, RuleAlert } from './types';
+import type { AgentMode, FlowSummary, WireEvent, Status, TimelineEntry, RuleAlert, McpCall } from './types';
 
 const MAX_FLOWS = 100_000;
 /** Rows per request: small pages keep every filter change instant. */
@@ -38,7 +38,21 @@ export const live = $state({
   scope: null as { include: string[]; exclude: string[] } | null,
   /** History and Site Map show only in-scope hosts: on by default, once a scope is set. */
   scopeOnly: localStorage.getItem('shiftwire.scopeOnly') !== 'false',
+  /** History shows Anthropic / Claude traffic (agents' own model API calls, tunneled untouched). */
+  showClaude: localStorage.getItem('shiftwire.showClaude') !== 'false',
 });
+
+export function setShowClaude(on: boolean): void {
+  live.showClaude = on;
+  localStorage.setItem('shiftwire.showClaude', String(on));
+  subscribe();
+  void loadHistory();
+}
+
+/** Hosts hidden when `showClaude` is off: each domain and all its subdomains. */
+const CLAUDE_HOSTS = ['anthropic.com', 'claude.ai', 'claude.com'];
+const claudeFilter = () =>
+  live.showClaude ? '' : `-(${CLAUDE_HOSTS.map((d) => `host:=${d} OR host:=*.${d}`).join(' OR ')})`;
 
 export const hasScope = () => (live.scope?.include.length ?? 0) > 0;
 
@@ -79,6 +93,14 @@ class Timeline {
   toast = $state<TimelineEntry | null>(null);
 }
 export const timeline = new Timeline();
+
+/** The MCP log: every MCP request agents made, oldest first (previews; the full call is fetched on demand). */
+export const mcpLog = $state({ calls: [] as McpCall[] });
+const MCP_CALLS = 5000;
+
+async function loadMcpLog(): Promise<void> {
+  mcpLog.calls = await fetch(`/api/mcp-calls?limit=${MCP_CALLS}`).then((r) => r.json());
+}
 
 /** The latest alert from a match & replace / alert rule, shown briefly as a toast. */
 export const alerts = $state({ last: null as RuleAlert | null });
@@ -170,7 +192,7 @@ export function idRange(text: string): [number, number] | null {
 
 export function effectiveFilter(): string {
   // A chip is row text (`*mozilla*`), or one field term as in the filter (`status:3*`).
-  const field = /^(host|path|url|method|actor|color|mime|type|note|tag|status|size|ms|time|id|#|is|has):\S+$/i;
+  const field = /^(host|path|url|method|actor|via|color|mime|type|note|tag|status|size|ms|time|id|#|is|has):\S+$/i;
   const terms = (t: string) => t.trim().split(/\s+/);
   const quote = (t: string) =>
     terms(t).every((w) => w === 'OR' || field.test(w.replace(/^\(+|\)+$/g, ''))) ? `(${t})` : `"${t.replaceAll('"', '')}"`;
@@ -179,6 +201,7 @@ export function effectiveFilter(): string {
   const parts = [
     live.filter ? `(${live.filter})` : '',
     scopeFilter(),
+    claudeFilter(),
     show.length ? `(${show.join(' OR ')})` : '',
     ...on.filter((p) => p.mode === 'hide').map((p) => `-${quote(p.text)}`),
     ...on.flatMap((p) => {
@@ -215,6 +238,13 @@ function handle(event: WireEvent): void {
         });
       void loadTabs();
       void loadTimeline();
+      void loadMcpLog();
+      break;
+    case 'mcp_calls_colored':
+      mcpLog.calls = mcpLog.calls.map((c) => (event.ids.includes(c.id) ? { ...c, color: event.color } : c));
+      break;
+    case 'mcp_call':
+      mcpLog.calls = [...mcpLog.calls, event.call].slice(-MCP_CALLS);
       break;
     case 'rule_alert':
       alerts.last = event;
@@ -231,6 +261,10 @@ function handle(event: WireEvent): void {
         subscribe();
         void loadHistory();
       }
+      break;
+    case 'status':
+      live.status = event.status;
+      live.agentMode = event.status.agent_mode;
       break;
     case 'repeater_changed':
       repeater.tabs = event.tabs;

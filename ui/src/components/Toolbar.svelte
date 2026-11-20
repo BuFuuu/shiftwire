@@ -2,6 +2,7 @@
   import Icon from './Icon.svelte';
   import { history, live, setFilter } from '../lib/live.svelte';
   import { setAgentMode } from '../lib/api';
+  import { nav, setAiTab } from '../lib/nav.svelte';
   import type { AgentMode } from '../lib/types';
 
   const modes: { id: AgentMode; label: string; help: string }[] = [
@@ -61,6 +62,14 @@
 
 <header class="toolbar">
   <h1>{title}</h1>
+  {#if nav.view === 'timeline'}
+    <div class="tabs" role="tablist" aria-label="AI Timeline view">
+      <button role="tab" aria-selected={nav.aiTab === 'plans'} class:on={nav.aiTab === 'plans'} onclick={() => setAiTab('plans')}
+        title="What the agents did, grouped by their plans (log_intent)">Plans</button>
+      <button role="tab" aria-selected={nav.aiTab === 'mcp'} class:on={nav.aiTab === 'mcp'} onclick={() => setAiTab('mcp')}
+        title="Every MCP request the agents sent and exactly what they got back">MCP log</button>
+    </div>
+  {/if}
   {#if filterable}
     <label class="filter" class:error={live.filterError} title={live.filterError ?? 'Filter (press /)'}>
       <Icon name="search" size={14} />
@@ -142,6 +151,26 @@
     white-space: nowrap;
     font-size: 11.5px;
     color: var(--red);
+  }
+  .tabs {
+    display: flex;
+    padding: 2px;
+    border-radius: 8px;
+    background: var(--field);
+  }
+  .tabs button {
+    border: 0;
+    background: none;
+    color: var(--text-2);
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 6px;
+  }
+  .tabs button.on {
+    background: var(--surface);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+    color: var(--text);
+    font-weight: 500;
   }
   .modes {
     margin-left: auto;

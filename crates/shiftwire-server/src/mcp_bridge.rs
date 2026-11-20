@@ -1,6 +1,6 @@
 //! `shiftwire mcp`: MCP over stdio for clients that only speak stdio.
 //!
-//! Each JSON-RPC line from stdin is forwarded to the daemon's `/mcp`, and the
+//! Each JSON-RPC line from stdin is forwarded to the daemon's MCP port, and the
 //! reply goes to stdout. Starts the daemon if it is not running. Nothing but
 //! protocol messages is ever written to stdout (diagnostics go to stderr).
 
@@ -16,8 +16,8 @@ use crate::daemon::{self, DaemonState, Paths};
 pub fn run(paths: &Paths, agent: Option<&str>) -> Result<()> {
     let state = ensure_daemon(paths)?;
     let url = match agent {
-        Some(a) => format!("{}/mcp?agent={}", state.api_url, a.replace(' ', "%20")),
-        None => format!("{}/mcp", state.api_url),
+        Some(a) => format!("{}/mcp?agent={}", state.mcp_url, a.replace(' ', "%20")),
+        None => format!("{}/mcp", state.mcp_url),
     };
     let mut session: Option<String> = None;
     let mut out = io::stdout().lock();

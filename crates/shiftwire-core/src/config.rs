@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// UI, REST API, WebSocket and MCP. Loopback unless explicitly changed.
+    /// UI, REST API and WebSocket. Loopback unless explicitly changed.
     pub api_addr: SocketAddr,
+    /// MCP for AI agents (`/mcp`), the only way in for agents besides the proxy.
+    pub mcp_addr: SocketAddr,
     /// The intercepting proxy clients (browser, VM, AI tools) point at.
     pub proxy_addr: SocketAddr,
     /// Where new projects are created (one folder each). Default: ~/shiftwire-projects.
@@ -23,12 +25,16 @@ pub struct Config {
     pub passthrough: Vec<String>,
     /// Verify target servers' certificates. Off by default: staging targets often have bad ones.
     pub verify_upstream_tls: bool,
+    /// The AI browser (Chrome, Edge or Chromium). Default: the first one found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_path: Option<PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             api_addr: ([127, 0, 0, 1], 7777).into(),
+            mcp_addr: ([127, 0, 0, 1], 7778).into(),
             proxy_addr: ([127, 0, 0, 1], 8080).into(),
             projects_dir: None,
             max_body_bytes: 2 * 1024 * 1024,
@@ -38,6 +44,7 @@ impl Default for Config {
                 .map(String::from)
                 .to_vec(),
             verify_upstream_tls: false,
+            browser_path: None,
         }
     }
 }
@@ -117,5 +124,6 @@ mod tests {
         let cfg: Config = toml::from_str("projects_dir = \"/tmp/p\"").unwrap();
         assert_eq!(cfg.projects_dir, Some(PathBuf::from("/tmp/p")));
         assert_eq!(cfg.proxy_addr.port(), 8080);
+        assert_eq!(cfg.mcp_addr.port(), 7778);
     }
 }

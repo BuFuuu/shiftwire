@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::events::{Bus, Event};
 use crate::filter::Filter;
-use crate::model::{Flow, FlowSummary, RepeaterTab, TimelineEntry};
+use crate::model::{Flow, FlowSummary, McpCall, RepeaterTab, TimelineEntry};
 use crate::sender::Target;
 
 const QUEUE_LEN: usize = 10_000;
@@ -74,6 +74,18 @@ CREATE TABLE IF NOT EXISTS timeline (
     severity TEXT
 );
 CREATE INDEX IF NOT EXISTS timeline_flow ON timeline(flow_id) WHERE flow_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS mcp_calls (
+    id TEXT PRIMARY KEY,           -- ULID: time order
+    ts INTEGER NOT NULL,
+    agent TEXT NOT NULL,
+    method TEXT NOT NULL,
+    tool TEXT,
+    request TEXT NOT NULL,
+    response TEXT NOT NULL,
+    is_error INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    color TEXT
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -89,7 +101,7 @@ CREATE TABLE IF NOT EXISTS repeater_tabs (
 );
 ";
 
-const SUMMARY_COLS: &str = "seq, intent, id, ts_start, ts_end, actor, method, scheme, host, port, path, query,
+const SUMMARY_COLS: &str = "seq, intent, id, ts_start, ts_end, actor, source, method, scheme, host, port, path, query,
     status, mime, resp_size, error, color, note,
     (SELECT severity FROM timeline WHERE timeline.flow_id = flows.id AND kind = 'mark' ORDER BY id DESC LIMIT 1) AS mark,
     (SELECT text FROM timeline WHERE timeline.flow_id = flows.id AND kind = 'mark' ORDER BY id DESC LIMIT 1) AS mark_reason,
@@ -243,12 +255,11 @@ impl Store {
     pub fn get(&self, id: &str) -> rusqlite::Result<Option<Flow>> {
         let conn = self.conn.lock().expect("store lock");
         let sql = format!(
-            "SELECT {SUMMARY_COLS}, source, http_version, req_head, req_body, req_size, req_trunc,
+            "SELECT {SUMMARY_COLS}, http_version, req_head, req_body, req_size, req_trunc,
                     resp_head, resp_body, resp_trunc FROM flows WHERE id = ?1"
         );
         conn.query_row(&sql, [id], |r| {
             let mut f = summary_row(r)?;
-            f.source = r.get("source")?;
             f.http_version = r.get("http_version")?;
             f.req_head = r.get("req_head")?;
             f.req_body = r.get("req_body")?;
@@ -428,6 +439,80 @@ impl Store {
         Ok(())
     }
 
+    pub fn add_mcp_call(&self, c: &McpCall) -> rusqlite::Result<()> {
+        self.conn.lock().expect("store lock").execute(
+            "INSERT INTO mcp_calls (id, ts, agent, method, tool, request, response, is_error, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                c.id,
+                c.ts as i64,
+                c.agent,
+                c.method,
+                c.tool,
+                c.request,
+                c.response,
+                c.is_error,
+                c.duration_ms as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The newest `limit` MCP calls older than `before` (if given), oldest first, with
+    /// request and response cut to `preview` characters; or one call (`id`) in full.
+    pub fn mcp_calls(
+        &self,
+        limit: usize,
+        before: Option<&str>,
+        preview: Option<usize>,
+        id: Option<&str>,
+    ) -> rusqlite::Result<Vec<McpCall>> {
+        let conn = self.conn.lock().expect("store lock");
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, agent, method, tool, is_error, duration_ms,
+                    CASE WHEN ?3 IS NULL THEN request ELSE substr(request, 1, ?3) END,
+                    CASE WHEN ?3 IS NULL THEN response ELSE substr(response, 1, ?3) END,
+                    length(request), length(response), color
+             FROM mcp_calls WHERE (?2 IS NULL OR id < ?2) AND (?4 IS NULL OR id = ?4)
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let preview = preview.map(|p| p as i64);
+        let mut rows: Vec<McpCall> = stmt
+            .query_map(params![limit as i64, before, preview, id], |r| {
+                Ok(McpCall {
+                    id: r.get(0)?,
+                    ts: r.get::<_, i64>(1)? as u64,
+                    agent: r.get(2)?,
+                    method: r.get(3)?,
+                    tool: r.get(4)?,
+                    is_error: r.get(5)?,
+                    duration_ms: r.get::<_, i64>(6)? as u64,
+                    request: r.get(7)?,
+                    response: r.get(8)?,
+                    request_size: r.get::<_, i64>(9)? as u64,
+                    response_size: r.get::<_, i64>(10)? as u64,
+                    color: r.get(11)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    pub fn color_mcp_calls(&self, ids: &[String], color: Option<&str>) -> rusqlite::Result<()> {
+        let sql = format!(
+            "UPDATE mcp_calls SET color = ?1 WHERE id IN ({})",
+            placeholders(ids.len(), 2)
+        );
+        let mut params: Vec<Value> = vec![color.map_or(Value::Null, |c| Value::Text(c.into()))];
+        params.extend(ids.iter().map(|id| Value::Text(id.clone())));
+        self.conn
+            .lock()
+            .expect("store lock")
+            .execute(&sql, params_from_iter(params))?;
+        Ok(())
+    }
+
     pub fn repeater_tabs(&self) -> rusqlite::Result<Vec<RepeaterTab>> {
         let conn = self.conn.lock().expect("store lock");
         let mut stmt = conn.prepare(
@@ -517,6 +602,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         .exists([])?;
     if !has_intent {
         conn.execute_batch("ALTER TABLE flows ADD COLUMN intent TEXT;")?;
+    }
+    let has_call_color = conn
+        .prepare("SELECT 1 FROM pragma_table_info('mcp_calls') WHERE name = 'color'")?
+        .exists([])?;
+    if !has_call_color {
+        conn.execute_batch("ALTER TABLE mcp_calls ADD COLUMN color TEXT;")?;
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS flows_seq ON flows(seq);")
 }
@@ -628,6 +719,7 @@ fn summary_row(r: &Row) -> rusqlite::Result<Flow> {
         ts_start: int(r, "ts_start")?,
         ts_end: int(r, "ts_end")?,
         actor: r.get("actor")?,
+        source: r.get("source")?,
         method: r.get("method")?,
         scheme: r.get("scheme")?,
         host: r.get("host")?,
@@ -887,9 +979,17 @@ mod tests {
             );
             if host == "tunnel.test" {
                 f.method = "CONNECT".into();
+                f.source = "tunnel".into();
             }
             if n == 2 {
                 f.method = "POST".into();
+                f.source = "mcp".into();
+            }
+            if n == 3 {
+                f.source = "invisible:localhost:8123".into();
+            }
+            if n == 4 {
+                f.source = "redirect".into(); // an early invisible-proxy build
             }
             ids.push(f.id.clone());
             store.record(f);
@@ -977,6 +1077,10 @@ mod tests {
             "status:2*",
             "intent:01ABC",
             "-intent:01ABC",
+            "via:mcp",
+            "via:invisible",
+            "-via:proxy",
+            "via:tun*",
             "idor",
             "auth*",
             "-idor",

@@ -11,7 +11,7 @@ use std::{fs, io};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, SerialNumber,
+    KeyUsagePurpose, PublicKeyData, SerialNumber,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::ServerConfig;
@@ -31,6 +31,9 @@ pub(crate) struct Ca {
     pem: String,
     fingerprint: String,
     leaf_key: KeyPair,
+    /// base64 SHA-256 of the CA's and the leaf's public keys, comma-separated: what
+    /// Chromium's `--ignore-certificate-errors-spki-list` wants.
+    spki_hashes: String,
     provider: Arc<CryptoProvider>,
     cache: Mutex<Cache>,
 }
@@ -54,13 +57,26 @@ impl Ca {
             create(&crt_path, &key_path)?
         };
         let ca_der = CertificateDer::from_pem_slice(pem.as_bytes()).map_err(io::Error::other)?;
+        let leaf_key = KeyPair::generate().map_err(io::Error::other)?;
+        let spki_hashes = [
+            key.subject_public_key_info(),
+            leaf_key.subject_public_key_info(),
+        ]
+        .iter()
+        .map(|der| {
+            let digest = ring::digest::digest(&ring::digest::SHA256, der);
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
         let issuer = Issuer::from_ca_cert_pem(&pem, key).map_err(io::Error::other)?;
         Ok(Self {
             fingerprint: fingerprint(&ca_der),
             issuer,
             ca_der,
             pem,
-            leaf_key: KeyPair::generate().map_err(io::Error::other)?,
+            leaf_key,
+            spki_hashes,
             provider,
             cache: Mutex::default(),
         })
@@ -68,6 +84,10 @@ impl Ca {
 
     pub fn cert_pem(&self) -> &str {
         &self.pem
+    }
+
+    pub fn spki_hashes(&self) -> &str {
+        &self.spki_hashes
     }
 
     /// SHA-256 of the CA certificate, `AB:CD:...`, to compare with what is installed.

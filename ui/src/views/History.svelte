@@ -4,6 +4,7 @@
   import VirtualList from '../components/VirtualList.svelte';
   import ContextMenu from '../components/ContextMenu.svelte';
   import PinBar from '../components/PinBar.svelte';
+  import ViaBadge from '../components/ViaBadge.svelte';
   import Detail from './Detail.svelte';
   import { history, live, loadOlder } from '../lib/live.svelte';
   import { colorFlows } from '../lib/api';
@@ -12,11 +13,12 @@
   import { bytes, statusClass, time } from '../lib/format';
   import { COLORS, type FlowSummary } from '../lib/types';
 
-  type SortKey = 'n' | 'actor' | 'method' | 'host' | 'path' | 'status' | 'size' | 'duration_ms';
+  type SortKey = 'n' | 'actor' | 'via' | 'method' | 'host' | 'path' | 'status' | 'size' | 'duration_ms';
   const columns: { label: string; key: SortKey }[] = [
     { label: '#', key: 'n' },
     { label: 'Time', key: 'n' },
     { label: 'Actor', key: 'actor' },
+    { label: 'Via', key: 'via' },
     { label: 'Method', key: 'method' },
     { label: 'Host', key: 'host' },
     { label: 'Path', key: 'path' },
@@ -228,6 +230,7 @@
             <span class="num">{number(f)}</span>
             <span class="num">{time(f.ts)}</span>
             <span><span class="actor" class:ai={f.actor !== 'proxy'}>{f.actor}</span></span>
+            <span><ViaBadge flow={f} /></span>
             <span class="method">{f.method}</span>
             <span class="clip">{f.host}{f.port !== 80 && f.port !== 443 ? `:${f.port}` : ''}</span>
             <span class="pathcell">
@@ -325,6 +328,9 @@
   .row:hover {
     background: var(--hover);
   }
+  .row.colored {
+    background: color-mix(in srgb, var(--c) 14%, transparent); /* the operator's color stays visible on striped and hovered rows */
+  }
   .row.picked {
     background: var(--accent);
     color: #fff;
@@ -335,7 +341,8 @@
     color: inherit;
   }
   .row.picked .actor,
-  .row.picked .tag {
+  .row.picked .tag,
+  .row.picked :global(.via) {
     color: #fff;
     background: rgba(255, 255, 255, 0.22);
   }

@@ -24,6 +24,9 @@ async fn session(mut socket: WebSocket, c: Ctx) {
     let mut events = c.app.subscribe();
     let mut stop = c.stop.subscribe();
     let mut ping = tokio::time::interval(Duration::from_secs(20));
+    // The status bar: pushed at most once a second, and only when something changed.
+    let mut status_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut last_status = status_key(&c);
     // Each window follows only the flows matching its own filter.
     let mut filter = Filter::default();
     if send(
@@ -72,6 +75,15 @@ async fn session(mut socket: WebSocket, c: Ctx) {
                 Some(Ok(_)) => Ok(()),
             },
             _ = ping.tick() => socket.send(Message::Ping(Bytes::new())).await,
+            _ = status_tick.tick() => {
+                let key = status_key(&c);
+                if key == last_status {
+                    Ok(())
+                } else {
+                    last_status = key;
+                    send(&mut socket, &json!({ "type": "status", "status": c.app.status() })).await
+                }
+            }
             () = stopped(&mut stop) => {
                 let _ = socket.send(Message::Close(None)).await;
                 break;
@@ -87,6 +99,13 @@ async fn session(mut socket: WebSocket, c: Ctx) {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
     Subscribe { filter: String },
+}
+
+/// The status as JSON, minus the uptime (which changes every second by itself).
+fn status_key(c: &Ctx) -> String {
+    let mut status = c.app.status();
+    status.uptime_s = 0;
+    serde_json::to_string(&status).expect("status always serializes")
 }
 
 /// Resolves once shutdown starts (drops the watch guard so the future stays `Send`).

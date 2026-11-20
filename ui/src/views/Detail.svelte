@@ -1,7 +1,12 @@
 <script lang="ts">
   import HttpMessage from '../components/HttpMessage.svelte';
+  import type { MenuItem } from '../components/TextMenu.svelte';
+  import { copyText } from '../lib/text';
+  import { toCurl } from '../lib/curl';
   import SideSplit from '../components/SideSplit.svelte';
   import ContextMenu from '../components/ContextMenu.svelte';
+  import ViaBadge from '../components/ViaBadge.svelte';
+  import { describeVia } from '../lib/via';
   import { jumpTo } from '../lib/live.svelte';
   import { nav } from '../lib/nav.svelte';
   import { openTab } from '../lib/repeater.svelte';
@@ -38,6 +43,18 @@
     if (e.key === 'Escape' && !typing && !menu && !document.querySelector('[role=menu]')) onclose();
   }
 
+  /** Extra right-click items in the request and response panes. */
+  const extras = (pane: 'request' | 'response') => (x: number, y: number): MenuItem[] => [
+    ...(pane === 'request' && detail
+      ? [
+          { label: 'Copy URL', action: () => copyText(url) },
+          { label: 'Copy as curl', action: () => copyText(toCurl(detail!)) },
+          { label: 'Send to Repeater', disabled: detail.method === 'CONNECT', action: () => openTab(detail!.id) },
+        ]
+      : []),
+    { label: 'Color, tags, mark, filter…', action: () => (menu = { x, y }) },
+  ];
+
   const url = $derived(
     detail ? `${detail.scheme}://${detail.host}${[80, 443].includes(detail.port) ? '' : `:${detail.port}`}${detail.path}` : '',
   );
@@ -63,6 +80,7 @@
       {/if}
       <button class="close" onclick={onclose} title="Close (Esc)">✕</button>
     </header>
+    <p class="meta-line"><ViaBadge flow={detail} /> {describeVia(detail)}</p>
     {#if detail.error}<p class="error">{detail.error}</p>{/if}
     {#if detail.mark}
       <p class="meta-line"><span class="mark sev-{detail.mark}">★ {detail.mark}</span> {detail.mark_reason}</p>
@@ -76,8 +94,8 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="panes" oncontextmenu={onContextMenu}>
       <SideSplit name="detail">
-        {#snippet left()}<HttpMessage title="Request" pane="request" message={detail!.request} />{/snippet}
-        {#snippet right()}<HttpMessage title="Response" pane="response" message={detail!.response} />{/snippet}
+        {#snippet left()}<HttpMessage title="Request" pane="request" message={detail!.request} extra={extras('request')} />{/snippet}
+        {#snippet right()}<HttpMessage title="Response" pane="response" message={detail!.response} extra={extras('response')} />{/snippet}
       </SideSplit>
     </div>
     {#if menu}

@@ -4,7 +4,9 @@
 //! * **Replace**: rewrite what matches, e.g. `^User-Agent: .*$` → `User-Agent: mine`.
 //! * **Alert**: change nothing, but tag the request and tell the operator when the
 //!   pattern matches, or (with `when_missing`) when it does not, e.g. "User-Agent
-//!   is not mine": `^User-Agent: mine$` + when missing.
+//!   is not mine": `^User-Agent: mine$` + when missing. With `block`, the request is
+//!   not sent at all (shiftWire answers 403). Agents' own MCP sends obey alert rules
+//!   too ([`Rules::check`]), so an agent cannot get around a block.
 //!
 //! Header rules see one `Name: value` line per header (`^`/`$` work per line);
 //! body rules see uncompressed bodies with a known length up to the capture limit.
@@ -32,6 +34,9 @@ pub struct Rule {
     /// Alert mode: alert when the pattern does *not* match.
     #[serde(default)]
     pub when_missing: bool,
+    /// Alert mode: also stop the request (shiftWire answers 403 instead of sending it).
+    #[serde(default)]
+    pub block: bool,
 }
 
 fn yes() -> bool {
@@ -59,6 +64,8 @@ pub struct Outcome {
     pub tags: Vec<String>,
     /// Names of the alert rules that fired.
     pub alerts: Vec<String>,
+    /// The first alert rule with `block` that fired: the request must not be sent.
+    pub blocked: Option<String>,
 }
 
 /// Rules with their patterns compiled, ready for the proxy.
@@ -117,11 +124,7 @@ impl Rules {
                 out.tags.push(tag("replaced", &rule.name));
             }
         }
-        for (rule, re, _) in self.active(RulePart::Headers) {
-            if rule.mode == RuleMode::Alert && re.is_match(&text) != rule.when_missing {
-                out.fire(rule);
-            }
-        }
+        self.alert_headers(&text, out);
         if text != original {
             *headers = parse_headers(&text);
         }
@@ -137,12 +140,31 @@ impl Rules {
                 changed = true;
             }
         }
+        self.alert_body(body, out);
+        changed
+    }
+
+    /// Alert rules only (nothing is changed): for requests shiftWire sends itself on an
+    /// agent's behalf. `headers` is one `Name: value` line per header.
+    pub fn check(&self, headers: &str, body: &[u8], out: &mut Outcome) {
+        self.alert_headers(headers, out);
+        self.alert_body(body, out);
+    }
+
+    fn alert_headers(&self, text: &str, out: &mut Outcome) {
+        for (rule, re, _) in self.active(RulePart::Headers) {
+            if rule.mode == RuleMode::Alert && re.is_match(text) != rule.when_missing {
+                out.fire(rule);
+            }
+        }
+    }
+
+    fn alert_body(&self, body: &[u8], out: &mut Outcome) {
         for (rule, _, re) in self.active(RulePart::Body) {
             if rule.mode == RuleMode::Alert && re.is_match(body) != rule.when_missing {
                 out.fire(rule);
             }
         }
-        changed
     }
 }
 
@@ -150,6 +172,16 @@ impl Outcome {
     fn fire(&mut self, rule: &Rule) {
         self.tags.push(tag("alert", &rule.name));
         self.alerts.push(rule.name.clone());
+        if rule.block && self.blocked.is_none() {
+            self.blocked = Some(rule.name.clone());
+        }
+    }
+
+    /// Why the request was stopped, for the flow's error and the client.
+    pub fn block_reason(&self) -> Option<String> {
+        self.blocked.as_ref().map(|rule| {
+            format!("blocked by the alert rule \"{rule}\" (Settings → Match & replace)")
+        })
     }
 }
 
@@ -210,6 +242,7 @@ mod tests {
             pattern: pattern.into(),
             replace: replace.into(),
             when_missing: false,
+            block: false,
         }
     }
 
@@ -260,6 +293,30 @@ mod tests {
         let mut out = Outcome::default();
         assert!(!rules.apply_body(&mut b"user=a&password=b".to_vec(), &mut out));
         assert_eq!(out.tags, ["alert:ua-check"]);
+    }
+
+    #[test]
+    fn blocking_alerts_and_checks_without_changes() {
+        let mut no_pw = rule(RuleMode::Alert, RulePart::Body, "password=", "");
+        no_pw.block = true;
+        let ua = rule(RuleMode::Alert, RulePart::Headers, "^User-Agent: curl", "");
+        let rules = Rules::compile(&[ua, no_pw]).unwrap();
+        let mut out = Outcome::default();
+        rules.check("Host: a.test\nUser-Agent: curl/8", b"password=x", &mut out);
+        assert_eq!(out.alerts.len(), 2);
+        assert_eq!(
+            out.blocked.as_deref(),
+            Some("UA check"),
+            "only the blocking rule"
+        );
+        assert!(
+            out.block_reason()
+                .unwrap()
+                .contains("blocked by the alert rule")
+        );
+        let mut quiet = Outcome::default();
+        rules.check("User-Agent: mine", b"user=a", &mut quiet);
+        assert!(quiet.alerts.is_empty() && quiet.blocked.is_none());
     }
 
     #[test]

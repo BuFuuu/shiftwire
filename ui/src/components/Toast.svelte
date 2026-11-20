@@ -17,8 +17,8 @@
 
 {#if alerts.last}
   {@const a = alerts.last}
-  <button class="toast alert" onclick={showAlert} title="Show this request in History">
-    <span class="sev">⚠ {a.rule}</span>
+  <button class="toast alert" class:blocked={a.blocked} onclick={showAlert} title="Show this request in History">
+    <span class="sev">{a.blocked ? '⛔ blocked' : '⚠'} {a.rule}</span>
     <span class="text"><b>#{a.seq}</b> {a.method} {a.url}</span>
   </button>
 {:else if timeline.toast}
@@ -33,7 +33,7 @@
   .toast {
     position: fixed;
     right: 18px;
-    bottom: 18px;
+    bottom: 40px; /* above the status bar */
     z-index: 60;
     max-width: 420px;
     display: flex;
@@ -66,6 +66,9 @@
   }
   .alert .sev {
     background: var(--orange);
+  }
+  .alert.blocked .sev {
+    background: var(--red);
   }
   .text {
     font-size: 12.5px;

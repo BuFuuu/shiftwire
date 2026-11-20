@@ -15,10 +15,11 @@
 shiftwire-projects/
 *.har
 
-# Local tool settings
+# Local tool settings (and Playwright MCP's default output folder)
 .claude/settings.local.json
 .mcp.json
 .env
+.playwright-mcp/
 
 # OS / editor
 .DS_Store

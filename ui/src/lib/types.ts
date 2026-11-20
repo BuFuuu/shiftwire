@@ -12,12 +12,39 @@ export interface Status {
   proxy_addr: string;
   proxy_running: boolean;
   proxy_error: string | null;
+  /** Client connections open on the proxy port now. */
+  proxy_connections: number;
+  /** Unix ms of the latest request on the proxy port, 0 if none yet. */
+  proxy_last_request: number;
+  mcp_addr: string;
+  mcp_running: boolean;
+  mcp_error: string | null;
   ca_fingerprint: string;
   flows: number;
   dropped: number;
   agents: number;
+  /** Agents active in the last 10 minutes, most recent first. */
+  agent_list: { name: string; last_seen: number }[];
   ai_paused: boolean;
   agent_mode: AgentMode;
+  /** The AI browser shiftWire opens (status bar → Open). */
+  browser: { running: boolean; binary: string | null; proxy_port: number | null; error: string | null };
+  /** What agents see of the target's names (Settings → Masking). */
+  masking: Masking;
+}
+
+export type MaskLevel = 'off' | 'addresses' | 'content' | 'strict';
+
+export interface Masking {
+  level: MaskLevel;
+  /** A real site and its stand-in (`target1.masked`); an empty alias gets the next free one. */
+  sites: { real: string; alias: string }[];
+  /** Strict: names replaced by `[word1]`, `[word2]`, ... */
+  words: string[];
+  /** Strict: hosts agents may see as they are (`*.gstatic.com`). */
+  allow: string[];
+  /** Strict: aliases given to other hosts so far (`h1.masked`). */
+  auto: { real: string; alias: string }[];
 }
 
 export type AgentMode = 'act' | 'advise' | 'off';
@@ -32,10 +59,14 @@ export interface Rule {
   pattern: string;
   replace: string;
   when_missing: boolean;
+  /** Alert mode: stop the request instead of sending it. */
+  block: boolean;
 }
 
 export interface RuleAlert {
   rule: string;
+  /** The rule stopped the request (it was not sent). */
+  blocked: boolean;
   flow_id: string;
   seq: number;
   method: string;
@@ -81,6 +112,28 @@ export interface FlowSummary {
   mark_reason: string | null;
   /** The agent's log_intent id it was sent under. */
   intent: string | null;
+  /** Which way it came in: proxy, browser, tunnel, repeater, mcp (filter `via:`); `invisible` on old rows. */
+  via: string;
+}
+
+/** One MCP request from an agent and exactly what it got back (the MCP log). */
+export interface McpCall {
+  id: string;
+  ts: number;
+  agent: string;
+  /** JSON-RPC method: tools/call, initialize, tools/list, ... */
+  method: string;
+  tool: string | null;
+  /** The tool's arguments (or the method's params) as JSON; in lists only the start. */
+  request: string;
+  /** What the agent got back; in lists only the start. */
+  response: string;
+  is_error: boolean;
+  duration_ms: number;
+  request_size: number;
+  response_size: number;
+  /** The operator's highlight, like a flow's (double-click toggles purple). */
+  color?: string | null;
 }
 
 export const SEVERITIES = ['info', 'low', 'medium', 'high', 'critical'] as const;
@@ -113,6 +166,9 @@ export const COLORS = ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'gr
 
 export type WireEvent =
   | { type: 'hello'; status: Status }
+  | { type: 'status'; status: Status }
+  | { type: 'mcp_call'; call: McpCall }
+  | { type: 'mcp_calls_colored'; ids: string[]; color: string | null }
   | { type: 'flow_added'; flow: FlowSummary; matches?: boolean }
   | { type: 'timeline'; entry: TimelineEntry }
   | { type: 'flow_updated'; flow: FlowSummary; matches: boolean }

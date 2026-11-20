@@ -7,10 +7,51 @@
 
 <script lang="ts">
   import type { Message } from '../lib/types';
+  import TextMenu, { type MenuItem } from './TextMenu.svelte';
+  import { base64Decode, copyText, selectedText, urlDecode } from '../lib/text';
   import { bytes, headerValue, hexPreview } from '../lib/format';
   import { escapeHtml, highlightForm, highlightHead, highlightJson, highlightMarkup } from '../lib/highlight';
 
-  let { title, pane, message }: { title: string; pane: 'request' | 'response'; message: Message | null } = $props();
+  let {
+    title,
+    pane,
+    message,
+    extra,
+  }: {
+    title: string;
+    pane: 'request' | 'response';
+    message: Message | null;
+    /** More menu items from the view (e.g. Copy URL, Send to Repeater), at the click position. */
+    extra?: (x: number, y: number) => MenuItem[];
+  } = $props();
+
+  const NL = String.fromCharCode(10);
+  const CR = String.fromCharCode(13);
+  let textMenu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
+
+  /** Right-click: copy the selection, the message or its parts, or decode the selection. */
+  function onMenu(e: MouseEvent) {
+    if (!message) return;
+    e.preventDefault();
+    e.stopPropagation(); // not the view's own menu
+    const sel = selectedText();
+    const head = message.head.replaceAll(CR, '').trimEnd();
+    const bodyText = message.body.text ?? '';
+    textMenu = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: 'Copy selection', hint: 'Ctrl+C', disabled: !sel, action: () => copyText(sel) },
+        { label: `Copy ${pane}`, action: () => copyText(bodyText ? head + NL + NL + bodyText : head) },
+        { label: 'Copy headers', action: () => copyText(head) },
+        { label: 'Copy body', disabled: !bodyText, action: () => copyText(bodyText) },
+        null,
+        { label: 'Copy selection URL-decoded', disabled: !sel, action: () => copyText(urlDecode(sel)) },
+        { label: 'Copy selection base64-decoded', disabled: !sel, action: () => copyText(base64Decode(sel)) },
+        ...(extra ? [null, ...extra(e.clientX, e.clientY)] : []),
+      ],
+    };
+  }
 
   const SHOW_LIMIT = 200_000;
   let showAll = $state(false);
@@ -37,7 +78,8 @@
   });
 </script>
 
-<section class="pane syntax">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<section class="pane syntax" oncontextmenu={onMenu}>
   <header>
     <h3>{title}</h3>
     <div class="tabs" role="tablist" aria-label="{title} view">
@@ -81,6 +123,10 @@
     </footer>
   {/if}
 </section>
+
+{#if textMenu}
+  <TextMenu x={textMenu.x} y={textMenu.y} items={textMenu.items} onclose={() => (textMenu = null)} />
+{/if}
 
 <style>
   .pane {

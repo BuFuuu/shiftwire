@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Where the UI and the proxy listen. Saving restarts shiftWire on the new
+  // Where the UI, the proxy and MCP listen. Saving restarts shiftWire on the new
   // addresses and moves this page there.
-  type Net = { api_addr: string; proxy_addr: string; api_token: string | null; proxy_password: string | null; wsl: boolean };
+  type Net = { api_addr: string; proxy_addr: string; mcp_addr: string; api_token: string | null; proxy_password: string | null; wsl: boolean };
   type Side = { iface: string; custom: string; port: string };
 
   const IFACES = [
@@ -13,6 +13,7 @@
   let net = $state<Net | null>(null);
   let ui = $state<Side>({ iface: '127.0.0.1', custom: '', port: '7777' });
   let proxy = $state<Side>({ iface: '127.0.0.1', custom: '', port: '8080' });
+  let mcp = $state<Side>({ iface: '127.0.0.1', custom: '', port: '7778' });
   let problem = $state<string | null>(null);
   let restarting = $state<string | null>(null);
 
@@ -32,16 +33,19 @@
     net = await fetch('/api/network').then((r) => r.json());
     ui = split(net!.api_addr);
     proxy = split(net!.proxy_addr);
+    mcp = split(net!.mcp_addr);
   }
   $effect(() => {
     void load();
   });
 
-  const changed = $derived(!!net && (join(ui) !== net.api_addr || join(proxy) !== net.proxy_addr));
+  const changed = $derived(
+    !!net && (join(ui) !== net.api_addr || join(proxy) !== net.proxy_addr || join(mcp) !== net.mcp_addr),
+  );
 
   async function save() {
     problem = null;
-    const body = { api_addr: join(ui), proxy_addr: join(proxy) };
+    const body = { api_addr: join(ui), proxy_addr: join(proxy), mcp_addr: join(mcp) };
     const res = await fetch('/api/network', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (!res.ok) {
       problem = await res.text();
@@ -88,11 +92,12 @@
   {/snippet}
 
   <div class="cols">
-    {@render side('UI, API and MCP', ui, 'Other machines need the access token (shown below once enabled).')}
     {@render side('Proxy', proxy, 'Clients from other machines need the proxy password: http://NAME:PASSWORD@host:port.')}
+    {@render side('MCP (AI agents)', mcp, 'Agents connect to http://host:port/mcp. From other machines they need the access token (Bearer).')}
+    {@render side('UI and API', ui, 'Other machines need the access token (shown below once enabled).')}
   </div>
 
-  {#if net?.wsl && (ui.iface !== '127.0.0.1' || proxy.iface !== '127.0.0.1')}
+  {#if net?.wsl && [ui, proxy, mcp].some((s) => s.iface !== '127.0.0.1')}
     <p class="warn">
       shiftWire runs in WSL2, which by default sits behind NAT: "all interfaces" are WSL's own, so Windows reaches
       it (localhost) but other machines and VMs on your network do not. To fix that, turn on WSL's mirrored networking:
@@ -104,7 +109,7 @@
   {#if net?.api_token || net?.proxy_password}
     <dl>
       {#if net.api_token}
-        <dt>UI token</dt><dd><code>{net.api_token}</code> &nbsp;open the UI once as <code>http://HOST:{split(net.api_addr).port}/?token=…</code></dd>
+        <dt>Access token</dt><dd><code>{net.api_token}</code> &nbsp;open the UI once as <code>http://HOST:{split(net.api_addr).port}/?token=…</code>; agents send <code>Authorization: Bearer …</code></dd>
       {/if}
       {#if net.proxy_password}
         <dt>Proxy password</dt><dd><code>{net.proxy_password}</code></dd>
@@ -137,7 +142,7 @@
   }
   .cols {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
     gap: 12px;
   }
   fieldset {

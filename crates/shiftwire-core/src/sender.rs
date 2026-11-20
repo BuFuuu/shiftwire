@@ -364,8 +364,26 @@ pub(crate) async fn send(
         ..Flow::default()
     };
 
+    // An agent's own sends obey the alert rules too, so it cannot get around a block.
+    let mut blocked = blocked;
+    if source == "mcp" {
+        let mut outcome = crate::rules::Outcome::default();
+        let headers: Vec<String> = req
+            .headers
+            .iter()
+            .map(|(n, v)| format!("{n}: {v}"))
+            .collect();
+        app.compiled_rules()
+            .check(&headers.join("\n"), &req.body, &mut outcome);
+        for rule in &outcome.alerts {
+            app.rule_alert(rule, &flow, outcome.blocked.as_ref() == Some(rule));
+        }
+        blocked = blocked.or_else(|| outcome.block_reason());
+        flow.tags = outcome.tags;
+    }
+
     if let Some(reason) = blocked {
-        // Refused (paused or out of scope): recorded so the operator sees the attempt.
+        // Refused (paused, out of scope, or an alert rule blocks it): recorded so the operator sees the attempt.
         flow.error = Some(reason);
         flow.ts_end = now_ms();
         app.record(flow.clone());

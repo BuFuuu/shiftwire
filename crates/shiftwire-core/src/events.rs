@@ -3,7 +3,7 @@
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::model::{AgentMode, FlowSummary, RepeaterTab, TimelineEntry};
+use crate::model::{AgentMode, FlowSummary, McpCall, RepeaterTab, TimelineEntry};
 use crate::project::Project;
 use crate::scope::Scope;
 
@@ -37,10 +37,21 @@ pub enum Event {
     /// An alert rule matched (or found something missing) in a proxied request.
     RuleAlert {
         rule: String,
+        /// The rule stopped the request (it was not sent).
+        blocked: bool,
         flow_id: String,
         seq: u64,
         method: String,
         url: String,
+    },
+    /// An agent made an MCP request (request and response cut to a preview).
+    McpCall {
+        call: McpCall,
+    },
+    /// The operator colored MCP calls (or cleared the color).
+    McpCallsColored {
+        ids: Vec<String>,
+        color: Option<String>,
     },
     /// The operator switched to another project: everything shown is now stale.
     ProjectChanged {

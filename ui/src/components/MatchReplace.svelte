@@ -22,6 +22,7 @@
     pattern: '',
     replace: '',
     when_missing: false,
+    block: false,
     ...over,
   });
 
@@ -30,6 +31,7 @@
     { label: 'Alert: User-Agent is not mine', rule: { name: 'foreign user agent', mode: 'alert', pattern: '^User-Agent: Mozilla/5.0 \\(pentest\\)$', when_missing: true } },
     { label: 'Remove a header', rule: { name: 'drop debug header', pattern: '^X-Debug: .*$', replace: '' } },
     { label: 'Alert: password in a body', rule: { name: 'password sent', mode: 'alert', part: 'body', pattern: 'password=' } },
+    { label: 'Block: password in a body', rule: { name: 'never send passwords', mode: 'alert', part: 'body', pattern: 'password=', block: true } },
   ];
 
   function add(over: Partial<Rule> = {}) {
@@ -117,6 +119,9 @@
                   <option value={true}>the pattern is missing</option>
                 </select>
               </label>
+              <label class="check" title="shiftWire answers 403 and the request never reaches the target">
+                <input type="checkbox" bind:checked={rule.block} onchange={() => (dirty = true)} /> Block the request
+              </label>
             {/if}
           </div>
         </div>
@@ -141,7 +146,9 @@
   </div>
   <p class="hint">
     Changed requests get the tag <code>replaced:&lt;name&gt;</code>, alerts <code>alert:&lt;name&gt;</code>: filter History with
-    <code>tag:alert*</code>. History shows each request as it was sent. Repeater and agent sends are not changed.
+    <code>tag:alert*</code>. History shows each request as it was sent. A blocking alert stops the request (shiftWire
+    answers 403; History shows it in red). Agents' own MCP sends obey alert and block rules too; replace rules change only
+    proxied requests, and your Repeater is never changed.
   </p>
 </div>
 
@@ -201,6 +208,13 @@
     font-size: 12px;
     font-weight: 500;
     color: var(--text-2);
+  }
+  label.check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    align-self: end;
+    height: 28px;
   }
   em {
     font-style: normal;

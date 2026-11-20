@@ -15,7 +15,8 @@ shiftwire stop
 shiftwire logs -f
 ```
 
-The UI is `http://127.0.0.1:7777` and the proxy is `127.0.0.1:8080`. Both are reachable from
+The UI is `http://127.0.0.1:7777`, the proxy is `127.0.0.1:8080` and MCP for agents is
+`http://127.0.0.1:7778/mcp`. All are reachable from
 Windows and from Kali. shiftWire keeps running in the background when you close the browser.
 
 ## 2. Trust the CA (once per browser or tool) to see HTTPS
@@ -72,14 +73,27 @@ The switch in the top right sets what agents may do:
 the Repeater and the Site Map and *prepare* requests as Repeater tabs; you review and press Send),
 **AI off** (everything they send is refused).
 
+**AI browser.** *AI browser → Open* in the status bar starts Chrome, Edge or Chromium routed through
+shiftWire (its own proxy port; the CA is trusted without installing it; cookies and logins live in the
+project folder). Log in by hand if needed, then let agents steer it with the `browser_*` MCP tools
+(navigate, snapshot, click, type, ...): shiftWire runs Playwright MCP for them, which needs Node.js
+(`npx`). Their browser requests appear under the agent's name, Via `browser`; `browser_navigate` is
+limited to the scope, and in advise mode agents can only look. Another browser: `browser_path` in
+`config.toml`.
+
+**Masking.** Settings → Masking gives the target stand-in names for agents (`example.com` →
+`target1.masked`), so its real names are not sent to the AI provider. *Addresses* masks URLs and
+address headers, *Content* every occurrence. Agents then use only shiftWire's MCP (not the proxy).
+It is not a sandbox: the page lists what it does not hide.
+
 **MCP.** For Claude Code running in Kali, add this to the project's `.mcp.json`:
 ```json
 { "mcpServers": { "shiftwire": { "command": "/home/YOU/shiftwire/target/release/shiftwire", "args": ["mcp", "--agent", "claude"] } } }
 ```
-or use the HTTP endpoint `http://127.0.0.1:7777/mcp?agent=claude`. Tools: `proxy_info`, `get_scope`,
+or use the HTTP endpoint `http://127.0.0.1:7778/mcp?agent=claude`. Tools: `proxy_info`, `get_scope`,
 `list_flows`, `get_flow`, `send_request`, `repeat_flow`, `tag_flows`, `set_note`, `log_intent`,
 `mark_flow`, `read_operator_messages`, `open_in_repeater`, `prepare_request`, `list_repeater_tabs`,
-`get_repeater_tab`, `sitemap`. Prefer MCP for single, deliberate requests;
+`get_repeater_tab`, `sitemap`, plus `browser_*` tools for the AI browser (below). Prefer MCP for single, deliberate requests;
 use the proxy for tools like ffuf, sqlmap or a browser. The **AI Timeline** shows each agent's plan
 (`log_intent`), the requests that followed and what it marked; type a message there and the agents
 receive it with their next action.
@@ -118,8 +132,8 @@ Clients from other machines then need a password: `shiftwire status` shows it (`
 `http://NAME:PASSWORD@<host>:8080`. Clients on this machine need none.
 
 To open the **UI from another machine**, set `api_addr = "0.0.0.0:7777"`; open it once as
-`http://<host>:7777/?token=…` with the token from `shiftwire status` (`UI token`). Agents use
-`Authorization: Bearer <token>` for `/mcp`.
+`http://<host>:7777/?token=…` with the token from `shiftwire status` (`UI token`). For agents on
+another machine set `mcp_addr = "0.0.0.0:7778"`; they send `Authorization: Bearer <token>`.
 
 ## 6. Known limits of this build
 

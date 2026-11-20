@@ -9,6 +9,8 @@
     projects: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
     search: 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4',
     radar: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 12l6-6',
+    copy: 'M9 9h11v11H9zM5 15H4V4h11v1',
+    check: 'M5 12.5l4.5 4.5L19 7',
   } as const;
   export type IconName = keyof typeof paths;
 </script>
