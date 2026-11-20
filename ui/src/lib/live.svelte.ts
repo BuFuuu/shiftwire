@@ -91,10 +91,16 @@ class History {
   /** Set by such a reload: the row the view should scroll to. */
   reveal = $state<{ index: number } | null>(null);
   /** The burst gap for the line next to the numbers (the last one picked in the menu). */
-  burstGap = $state(2000);
+  burstGap = $state(Number(localStorage.getItem('shiftwire.burstGap') ?? 2000));
 }
 export const history = new History();
 const timeOrder = () => history.sort.key === 'n' && !history.sort.desc;
+
+/** The burst gap (History's lines, Show / Hide burst), kept in the browser. */
+export function setBurstGap(ms: number): void {
+  history.burstGap = ms;
+  localStorage.setItem('shiftwire.burstGap', String(ms));
+}
 
 export function setSort(key: SortKey): void {
   history.sort = history.sort.key === key ? { key, desc: !history.sort.desc } : { key, desc: false };

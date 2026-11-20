@@ -3,13 +3,11 @@
 // the same way in, with no quiet gap longer than a limit (the server walks it:
 // GET /api/flows/{id}/burst).
 
-import { history, jumpTo } from './live.svelte';
+import { addPin, history, jumpTo } from './live.svelte';
 import type { Burst, FlowSummary } from './types';
 
 /** The gaps offered in the menu, in seconds. */
 export const BURST_GAPS = [1, 2, 3, 10, 30];
-/** The gap of the plain "Show burst" and of the lines in History. */
-export const DEFAULT_GAP = 2;
 
 export async function burstOf(f: FlowSummary, gapMs: number, signal?: AbortSignal): Promise<Burst | null> {
   const res = await fetch(`/api/flows/${encodeURIComponent(f.id)}/burst?gap_ms=${gapMs}`, { signal });
@@ -69,10 +67,11 @@ export function burstLines(
   return lines;
 }
 
-/** Show the burst as a History chip; the History line uses this gap from now on. */
-export async function showBurst(f: FlowSummary, gapSeconds: number): Promise<void> {
-  history.burstGap = gapSeconds * 1000;
-  const b = await burstOf(f, gapSeconds * 1000);
+/** Show only the burst (a chip that replaces the last "show" jump), or hide it (a lasting
+ *  hide chip). Uses the gap picked in the menu, which the History lines follow too. */
+export async function filterBurst(f: FlowSummary, mode: 'show' | 'hide'): Promise<void> {
+  const b = await burstOf(f, history.burstGap);
   if (!b) return;
-  jumpTo(burstFilter(b));
+  if (mode === 'show') jumpTo(burstFilter(b));
+  else addPin('hide', burstFilter(b));
 }

@@ -1,7 +1,8 @@
 <script lang="ts">
   // Lasting filters: "hide *mozilla*", "show only shop.test". They stay until
   // removed, and apply on top of whatever is typed in the main filter.
-  import { addPin, effectiveFilter, hasScope, history, idRange, live, newestMatch, setPins, setScopeOnly, type Pin } from '../lib/live.svelte';
+  import { addPin, effectiveFilter, hasScope, history, idRange, live, newestMatch, setBurstGap, setPins, setScopeOnly, type Pin } from '../lib/live.svelte';
+  import { BURST_GAPS } from '../lib/around';
 
   // Exports exactly what History shows (main filter + chips).
   const harHref = $derived(`/api/export/har?filter=${encodeURIComponent(effectiveFilter())}`);
@@ -106,10 +107,50 @@
     </button>
     <button class="add" onclick={clear} disabled={!history.total} title="Hide every request up to now; new ones keep appearing. Nothing is deleted: remove the chip to see them again.">Clear</button>
   {/if}
+  <div class="gap" title="Burst gap: requests by one actor belong to one burst while no pause between two of them is longer than this. The lines next to the numbers and Show / Hide burst use it.">
+    <span>Burst gap</span>
+    <div class="gaps" role="radiogroup" aria-label="Burst gap">
+      {#each BURST_GAPS as s (s)}
+        <button role="radio" aria-checked={history.burstGap === s * 1000} class:on={history.burstGap === s * 1000} onclick={() => setBurstGap(s * 1000)}>{s}s</button>
+      {/each}
+    </div>
+  </div>
   <a class="export" href={harHref} download title="Download the requests shown here as a HAR file (for browsers, Burp, ZAP)">Export HAR</a>
 </div>
 
 <style>
+  .gap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+  .gaps {
+    display: flex;
+    padding: 2px;
+    border-radius: 7px;
+    background: var(--field);
+  }
+  .gaps button {
+    min-width: 26px;
+    padding: 1px 5px;
+    border: 0;
+    border-radius: 5px;
+    background: none;
+    color: var(--text-2);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .gaps button.on {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 0 0 1px var(--hairline);
+  }
+  .gaps button:hover:not(.on) {
+    color: var(--accent);
+  }
   .pins {
     display: flex;
     align-items: center;
@@ -196,7 +237,7 @@
     border-color: var(--text-3);
   }
   .export {
-    margin-left: auto;
+    margin-left: 10px;
     font-size: 11.5px;
     color: var(--text-2);
     text-decoration: none;
